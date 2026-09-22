@@ -1,0 +1,19 @@
+# Python bytecode. Regenerated on every import and tied to the exact interpreter
+# (Blender 5.2 ships CPython 3.13, hence the cpython-313 tags). Never useful to
+# share, and it goes stale the moment a module moves.
+__pycache__/
+*.py[cod]
+
+# Blender incremental saves, written next to the .blend on each save.
+*.blend1
+*.blend2
+*.blend@
+
+# Exported meshes. Build artifacts of this tooling, not source.
+*.fbx
+*.gltf
+*.glb
+
+# Windows shell cruft.
+Thumbs.db
+desktop.ini

@@ -1,0 +1,13 @@
+{
+    "python.defaultInterpreterPath": "C:\\Program Files\\Blender Foundation\\Blender 5.2\\5.2\\python\\bin\\python.exe",
+    "python.analysis.extraPaths": [
+        "C:\\Program Files\\Blender Foundation\\Blender 5.2\\5.2\\scripts\\modules"
+    ],
+    "python-envs.pythonProjects": [
+        {
+            "path": ".",
+            "envManager": "ms-python.python:system",
+            "packageManager": "ms-python.python:pip"
+        }
+    ]
+}
