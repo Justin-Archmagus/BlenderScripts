@@ -19,9 +19,11 @@ WHY THAT CONTEXT
 WHAT IT ANSWERS
     The index-delta histogram is the point of this script. In a row-major grid of
     width W, every edge joins indices differing by exactly 1 (across the profile)
-    or exactly W (along the length). If two spikes dominate that histogram, the
-    vertex layout is predictable and Simplify can pick columns arithmetically --
-    column = index % W -- instead of walking edge loops topologically.
+    or exactly W (along the length) -- plus, with Solidify, the shell stride
+    (rim edges joining each vertex to its twin on the other shell). If those
+    spikes dominate the histogram, the vertex layout is predictable and Simplify
+    can pick columns arithmetically -- column = index % W -- instead of walking
+    edge loops topologically.
 
     If it does NOT spike, the layout is irregular and Simplify has to walk the
     topology instead. Either is workable; they are very different amounts of code,
@@ -115,11 +117,24 @@ def analyze(bm: bmesh.types.BMesh) -> list[str]:
     others = [d for d, _ in deltas.most_common() if d != 1]
     if others:
         width = others[0]
-        explained = deltas.get(1, 0) + deltas.get(width, 0)
-        share = 100.0 * explained / edge_count
+        families = [1, width]
         lines.append("")
         lines.append(f"  grid-width hypothesis : {width}")
-        lines.append(f"  edges explained by deltas {{1, {width}}} : "
+
+        # The next delta is the shell stride if Solidify made two shells. Counted
+        # only when it is consistent with that -- a multiple of the width that
+        # splits the vertices into whole shells -- so a stray delta cannot pad
+        # the coverage. Same rule as mesh_simplify_core.recover_grid().
+        if len(others) > 1:
+            stride = others[1]
+            shells = len(verts) // stride
+            if shells > 1 and shells * stride == len(verts) and stride % width == 0:
+                families.append(stride)
+                lines.append(f"  shell hypothesis      : {shells} shells, rim stride {stride}")
+
+        explained = sum(deltas.get(d, 0) for d in families)
+        share = 100.0 * explained / edge_count
+        lines.append(f"  edges explained by deltas {families} : "
                      f"{explained}/{edge_count}  ({share:.1f}%)")
         if share > 90.0:
             lines.append("  -> row-major layout looks SOLID; column = index % width")
@@ -150,22 +165,26 @@ def main() -> list[str]:
     obj = bpy.context.active_object
     if obj is None:
         return ["  ABORTED: no active object."]
-    if obj.type != 'MESH':
+    # Narrows Object.data -- a union of every data type -- which the type string
+    # cannot. Exact class check, as everywhere in this repo: it also rejects
+    # subclasses, so no one has to know which data types have them.
+    mesh = obj.data
+    if type(mesh) is not bpy.types.Mesh:
         return [f"  ABORTED: active object {obj.name!r} is a {obj.type}, not a MESH."]
 
     header = [
-        f"  object   : {obj.name!r}  (data {obj.data.name!r})",
+        f"  object   : {obj.name!r}  (data {mesh.name!r})",
         f"  mode     : {bpy.context.mode}",
         "",
     ]
 
     if bpy.context.mode == 'EDIT_MESH':
         # Live edit bmesh: read only, and never freed -- Blender owns it.
-        return header + analyze(bmesh.from_edit_mesh(obj.data))
+        return header + analyze(bmesh.from_edit_mesh(mesh))
 
     bm = bmesh.new()
     try:
-        bm.from_mesh(obj.data)
+        bm.from_mesh(mesh)
         return header + analyze(bm)
     finally:
         bm.free()

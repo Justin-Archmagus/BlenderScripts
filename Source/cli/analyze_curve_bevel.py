@@ -22,15 +22,17 @@ THE THING THIS EXISTS TO ANSWER
       ALONG the curve  -> Curve.resolution_u, or Spline.resolution_u per spline
       ACROSS the curve -> depends on bevel_mode:
             ROUND   -> Curve.bevel_resolution, segments per QUARTER circle, so
-                       the result is always a multiple of 4
+                       the result is always a multiple of 4 (unverified here)
             OBJECT  -> the BEVEL OBJECT's own splines, not a property of this
                        curve at all
-            PROFILE -> Curve.bevel_profile, a readonly CurveProfile. Its sampled
-                       count is set by initialize(totsegments); the control point
-                       count and the two sampling flags also shape the result
+            PROFILE -> Curve.bevel_resolution again, NOT the CurveProfile's own
+                       sampled segment count. Measured 2026-09-22 on this
+                       project's 5-point STEPS profile: width = 2 x
+                       bevel_resolution + 3, while profile.segments read 3.
 
-    The report prints every candidate source, then the width actually measured
-    off the evaluated mesh. Where they disagree, the measurement wins.
+    Every mode yields a predicted width, and the report checks it against the
+    width measured off the evaluated mesh. The measurement wins; a mismatch
+    means the prediction formula is wrong for that curve, and says so.
 """
 
 from collections import Counter
@@ -71,8 +73,9 @@ def spline_point_count(spline: bpy.types.Spline) -> tuple[int, str]:
     )
 
 
-def describe_profile_source(curve: bpy.types.Curve) -> list[str]:
-    """Every candidate source of ACROSS-curve density, for this bevel_mode."""
+def describe_profile_source(curve: bpy.types.Curve) -> tuple[list[str], int | None]:
+    """Report lines for the ACROSS-curve density source, plus the width it
+    predicts -- or None when this mode gives nothing to predict from."""
     mode = curve.bevel_mode
     lines = [f"  bevel_mode            : {mode}"]
 
@@ -82,102 +85,124 @@ def describe_profile_source(curve: bpy.types.Curve) -> list[str]:
             f"  bevel_depth           : {curve.bevel_depth}",
             f"  bevel_resolution      : {curve.bevel_resolution}  "
             f"(segments per QUARTER circle)",
-            f"  -> predicted profile  : {predicted} points (always a multiple of 4)",
+            f"  -> predicted width    : 4 x ({curve.bevel_resolution} + 1) = "
+            f"{predicted}  (formula not yet measured on this project)",
             "  KNOB: Curve.bevel_resolution on this curve. 0 gives a 4-point diamond.",
-        ]
+        ], predicted
 
     if mode == 'OBJECT':
         bevel_object = curve.bevel_object
         if bevel_object is None:
-            return lines + ["  bevel_object          : None (no bevel geometry)"]
+            return lines + ["  bevel_object          : None (no bevel geometry)"], None
         lines.append(f"  bevel_object          : {bevel_object.name!r} "
                      f"({bevel_object.type})")
-        if bevel_object.type != 'CURVE':
-            return lines + ["  -> bevel object is not a CURVE; cannot predict width"]
+        bevel_curve = bevel_object.data
+        if type(bevel_curve) is not bpy.types.Curve:
+            return lines + ["  -> bevel object is not a CURVE; cannot predict width"], None
 
-        bevel_curve: bpy.types.Curve = bevel_object.data
         total = 0
         for index, spline in enumerate(bevel_curve.splines):
             count, why = spline_point_count(spline)
             total += count
             lines.append(f"      spline[{index}] : {why}")
         return lines + [
-            f"  -> predicted profile  : {total} points",
+            f"  -> predicted width    : {total}",
             f"  KNOB: NOT on this curve. Edit {bevel_object.name!r} -- lower its",
             "        spline resolution_u, or remove control points.",
-        ]
+        ], total
 
     if mode == 'PROFILE':
+        resolution = curve.bevel_resolution
+        predicted = 2 * resolution + 3
+        lines += [
+            f"  bevel_resolution      : {resolution}",
+            f"  -> predicted width    : 2 x {resolution} + 3 = {predicted}",
+            "     Empirical, from this project's 5-point STEPS profile. Always odd,",
+            "     so an even width is unreachable through this knob.",
+            "  KNOB: Curve.bevel_resolution on this curve.",
+        ]
+
         profile = curve.bevel_profile
         if profile is None:
-            return lines + ["  bevel_profile         : None"]
+            return lines + ["  bevel_profile         : None"], predicted
 
-        control_points = len(profile.points)
-        sampled = len(profile.segments)
+        # Shape context only. On the measured profile, segments read 3 while the
+        # width was 7, so the sampled count is not what sets the width.
         lines += [
-            f"  preset                : {profile.preset}",
-            f"  points (control)      : {control_points}",
-            f"  segments (sampled)    : {sampled}   <-- readonly result",
-            f"  use_sample_straight_edges : {profile.use_sample_straight_edges}"
-            f"   (sample edges with vector handles)",
-            f"  use_sample_even_lengths   : {profile.use_sample_even_lengths}",
-            f"  bevel_resolution      : {curve.bevel_resolution}"
-            f"   (listed to test whether it correlates; for ROUND it would imply "
-            f"{4 * (curve.bevel_resolution + 1)})",
             "",
+            "  Profile shape (context; did not set the width when measured):",
+            f"  preset                : {profile.preset}",
+            f"  points (control)      : {len(profile.points)}",
+            f"  segments (sampled)    : {len(profile.segments)}",
+            f"  use_sample_straight_edges : {profile.use_sample_straight_edges}",
+            f"  use_sample_even_lengths   : {profile.use_sample_even_lengths}",
             "  Control point locations:",
         ]
         for index, point in enumerate(profile.points):
             lines.append(f"      [{index:2}]  ({point.location[0]:8.4f}, "
                          f"{point.location[1]:8.4f})")
-        lines += [
-            "",
-            "  KNOB candidates, in the order worth trying:",
-            "    1. CurveProfile.initialize(totsegments) -- sets the sampled count",
-            "       directly. MUTATES the profile, so it is not called here.",
-            "    2. Remove control points; the sampled curve follows them.",
-            "    3. use_sample_straight_edges=True, which samples vector-handle",
-            "       edges without subdividing them.",
-            "  Compare 'segments (sampled)' against the measured width below: if",
-            "  they match, the profile sampling is the source and knob 1 applies.",
-        ]
-        return lines
+        return lines, predicted
 
-    return lines + [f"  (unhandled bevel_mode {mode!r})"]
+    return lines + [f"  (unhandled bevel_mode {mode!r})"], None
 
 
-def measure_generated_width(obj: bpy.types.Object) -> list[str]:
-    """Actual profile width, read off the evaluated mesh.
+def measure_generated_width(obj: bpy.types.Object) -> tuple[list[str], int | None]:
+    """Actual profile width, read off the evaluated mesh, plus the report lines.
 
-    Same index-delta trick as analyze_mesh_topology: in a row-major grid the
-    dominant non-1 delta is the row stride, which is the profile width.
+    Same index-delta trick as mesh_simplify_core.recover_grid(): in a row-major
+    grid the dominant non-1 delta is the row stride, which is the profile width.
+    With Solidify, the next delta is the shell stride -- rim edges joining each
+    vertex to its twin on the other shell. Those count toward the fit; leaving
+    them out made every solidified mesh read ~92% when it was a perfect grid.
     """
     depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated = obj.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh()
     try:
+        # None for object types with no geometry. A curve always yields a mesh,
+        # even an empty one, so this is a guard rather than an expected path.
+        if mesh is None:
+            return ["  evaluated mesh        : none -- object produced no geometry"], None
         verts, edges, faces = len(mesh.vertices), len(mesh.edges), len(mesh.polygons)
         if edges == 0:
             return [
                 f"  evaluated mesh        : {verts} verts, no edges",
                 "  -> no surface generated; the curve has no bevel or extrude",
-            ]
-
-        deltas = Counter(abs(e.vertices[0] - e.vertices[1]) for e in mesh.edges)
+            ], None
+        # The stubs' bpy_prop_array defines no __getitem__, though indexing works
+        # at runtime. Suppressed on this line only, so the stub gap stays visible.
+        deltas = Counter(abs(e.vertices[0] - e.vertices[1]) for e in mesh.edges)  # pyright: ignore[reportIndexIssue]
         lines = [f"  evaluated mesh        : {verts} verts, {edges} edges, {faces} faces"]
         others = [d for d, _ in deltas.most_common() if d != 1]
         if not others:
-            return lines + ["  -> only delta-1 edges; not a grid"]
+            return lines + ["  -> only delta-1 edges; not a grid"], None
 
         width = others[0]
-        explained = deltas.get(1, 0) + deltas.get(width, 0)
+        families = [1, width]
+        shells_line = "  shells                : 1"
+        if len(others) > 1:
+            stride = others[1]
+            # Counted only if it splits the verts into whole shells and is a
+            # multiple of the width, so a stray delta cannot pad the fit.
+            shells = verts // stride
+            if shells > 1 and shells * stride == verts and stride % width == 0:
+                families.append(stride)
+                shells_line = f"  shells                : {shells}  (rim stride {stride})"
+            else:
+                shells_line = (
+                    f"  shells                : 1  (next delta {stride} is not a "
+                    f"shell stride; not counted)"
+                )
+
+        explained = sum(deltas.get(d, 0) for d in families)
         share = 100.0 * explained / edges
         return lines + [
             f"  measured width        : {width}",
-            f"  grid fit              : deltas {{1, {width}}} cover "
+            shells_line,
+            f"  grid fit              : deltas {families} cover "
             f"{explained}/{edges} edges ({share:.1f}%)",
             f"  top deltas            : {deltas.most_common(6)}",
-        ]
+        ], width
     finally:
         evaluated.to_mesh_clear()
 
@@ -186,10 +211,10 @@ def main() -> list[str]:
     obj = bpy.context.active_object
     if obj is None:
         return ["  ABORTED: no active object."]
-    if obj.type != 'CURVE':
+    curve = obj.data
+    if type(curve) is not bpy.types.Curve:
         return [f"  ABORTED: active object {obj.name!r} is a {obj.type}, not a CURVE."]
 
-    curve: bpy.types.Curve = obj.data
     lines = [
         f"  object                : {obj.name!r}  (data {curve.name!r})",
         f"  modifiers             : {[m.name for m in obj.modifiers] or 'none'}",
@@ -204,10 +229,20 @@ def main() -> list[str]:
         _, why = spline_point_count(spline)
         lines.append(f"      spline[{index}] : {why}")
 
-    lines += ["", "  --- ACROSS the curve (the profile) ---"]
-    lines += describe_profile_source(curve)
-    lines += ["", "  --- measured ---"]
-    lines += measure_generated_width(obj)
+    profile_lines, predicted = describe_profile_source(curve)
+    measured_lines, measured = measure_generated_width(obj)
+    lines += ["", "  --- ACROSS the curve (the profile) ---", *profile_lines]
+    lines += ["", "  --- measured ---", *measured_lines]
+
+    if predicted is not None and measured is not None:
+        lines.append("")
+        if predicted == measured:
+            lines.append(f"  -> MATCH: predicted width {predicted} = measured")
+        else:
+            lines.append(
+                f"  -> MISMATCH: predicted width {predicted}, measured {measured}. "
+                f"The formula above is wrong for this curve; trust the measurement."
+            )
     return lines
 
 

@@ -119,7 +119,7 @@ def format_report(plan: SimplifyPlan, dry_run: bool) -> str:
     lines = [
         format_header("DRY RUN" if dry_run else "LIVE"),
         f"  object                : {plan.source.name!r} "
-        f"(data {plan.source.data.name!r})",
+        f"(data {plan.mesh.name!r})",
         "",
         "  --- recovered grid ---",
         f"  width x rows x shells : {grid.width} x {grid.rows} x {grid.shells}",
@@ -146,13 +146,12 @@ def format_report(plan: SimplifyPlan, dry_run: bool) -> str:
         "",
         f"  keep                  : {list(plan.keep_columns)}",
         f"  dissolve              : {list(plan.dissolve_columns)}",
-        f"  lengthwise edges hit  : {plan.edges_to_dissolve}",
+        f"  edges to dissolve     : {plan.edges_to_dissolve} "
+        f"({plan.edges_to_dissolve - plan.rim_edges_to_dissolve} lengthwise + "
+        f"{plan.rim_edges_to_dissolve} end-cap rim)",
         f"  verts {grid.verts} -> {plan.predicted_verts} (predicted)",
-        f"      {grid.shells} shells x ({max(0, grid.rows - 2)} interior rows x "
-        f"{len(plan.keep_columns)} kept + {min(2, grid.rows)} end rows x "
-        f"{grid.width} full)",
-        "      End rows keep full width: a vertex there carries a rim edge, so it",
-        "      stays 3-valent after the dissolve and use_verts leaves it alone.",
+        f"      {grid.shells} shells x {grid.rows} rows x "
+        f"{len(plan.keep_columns)} kept columns",
     ]
 
     if plan.warnings:
@@ -183,7 +182,9 @@ def emit_report(report: str, text_name: str = REPORT_TEXT_NAME) -> bpy.types.Tex
     return text
 
 
-def _run(core: ModuleType) -> str:
+def _run(core: ModuleType, sections: list[str]) -> None:
+    """Append each report section as soon as it exists, so a failure during
+    execution still leaves the plan in the report. See spline_to_unreal_mesh."""
     settings = core.SimplifySettings(
         angle_threshold_deg=ANGLE_THRESHOLD_DEG,
         keep_columns_override=KEEP_COLUMNS_OVERRIDE,
@@ -191,21 +192,20 @@ def _run(core: ModuleType) -> str:
     )
 
     plan = core.build_simplify_plan(bpy.context, settings)
-    report = format_report(plan, DRY_RUN)
+    sections.append(format_report(plan, DRY_RUN))
     if DRY_RUN:
-        return report
+        return
 
     result = core.execute_simplify_plan(bpy.context, plan)
-    return f"{report}\n{format_result(result)}"
+    sections.append(format_result(result))
 
 
 if __name__ == "__main__":
-    _core = None
+    _sections: list[str] = []
     try:
-        _core = _load_core()
-        _report = _run(_core)
+        _run(_load_core(), _sections)
     except Exception:
         import traceback
-        _report = f"{format_header('ABORTED')}\n\n{traceback.format_exc()}"
-
-    emit_report(_report)
+        _sections += [format_header("ABORTED"), "", traceback.format_exc()]
+    finally:
+        emit_report("\n".join(_sections))

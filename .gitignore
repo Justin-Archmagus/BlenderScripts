@@ -4,6 +4,9 @@
 __pycache__/
 *.py[cod]
 
+# Infrastructure and local configuration
+.venv/
+
 # Blender incremental saves, written next to the .blend on each save.
 *.blend1
 *.blend2

@@ -141,13 +141,13 @@ def format_report(plan: ExportPlan, dry_run: bool) -> str:
     settings = plan.settings
     lines = [
         format_header("DRY RUN" if dry_run else "LIVE"),
-        f"  source curve     : {src.name!r}  (data {src.data.name!r})",
+        f"  source curve     : {src.name!r}  (data {plan.curve.name!r})",
         f"  collections      : {[c.name for c in src.users_collection]}",
         f"  location         : {tuple(round(v, 4) for v in src.location)}",
         f"  rotation (rad)   : {tuple(round(v, 4) for v in src.rotation_euler)}",
         f"  scale            : {tuple(round(v, 4) for v in src.scale)}",
         f"  modifiers        : {[m.name for m in src.modifiers] or 'none'}",
-        f"  materials        : {[m.name for m in src.data.materials if m] or 'none'}",
+        f"  materials        : {[m.name for m in plan.curve.materials if m] or 'none'}",
         f"  evaluated result : {plan.verts} verts, {plan.polys} polys",
         f"  scene unit scale : {plan.unit_scale}  (system {plan.unit_system})",
         "",
@@ -213,7 +213,13 @@ def emit_report(report: str, text_name: str = REPORT_TEXT_NAME) -> bpy.types.Tex
     return text
 
 
-def _run(core: ModuleType) -> str:
+def _run(core: ModuleType, sections: list[str]) -> None:
+    """Append each report section as soon as it exists.
+
+    Appended rather than returned so that when execute_plan() raises, the plan
+    already rendered survives into the report next to the traceback -- which is
+    the context needed to read the traceback.
+    """
     settings = core.ExportSettings(
         export_dir=EXPORT_DIR,
         export_collection=EXPORT_COLLECTION,
@@ -224,24 +230,23 @@ def _run(core: ModuleType) -> str:
     )
 
     plan = core.build_plan(bpy.context, settings)
-    report = format_report(plan, DRY_RUN)
+    sections.append(format_report(plan, DRY_RUN))
 
     if DRY_RUN:
-        return report
+        return
 
     result = core.execute_plan(bpy.context, plan)
-    return f"{report}\n{format_result(plan, result)}"
+    sections.append(format_result(plan, result))
 
 
 if __name__ == "__main__":
-    _core = None
+    _sections: list[str] = []
     try:
-        _core = _load_core()
-        _report = _run(_core)
+        _run(_load_core(), _sections)
     except Exception:
         # Full traceback, not just the message -- otherwise an unexpected error
         # lands only in the hidden console and looks like a silent failure again.
         import traceback
-        _report = f"{format_header('ABORTED')}\n\n{traceback.format_exc()}"
-
-    emit_report(_report)
+        _sections += [format_header("ABORTED"), "", traceback.format_exc()]
+    finally:
+        emit_report("\n".join(_sections))

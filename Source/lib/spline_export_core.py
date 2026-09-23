@@ -36,15 +36,21 @@ STATUS
     So the axis and scale settings carried in that preset -- axis_forward='-Z',
     axis_up='Y', bake_space_transform=True -- are confirmed against the real
     importer, not just against the docs.
+
+    Hardened and tested in Blender 2026-09-23: excluded/hidden/locked export collections
+    refused, Blender-relative export folders resolved, name override sanitized,
+    name clashes warned, operator results checked, and execute_plan() rolls back
+    its partial mesh (and any file it newly created) on failure.
 """
 
 import ast
 import re
 import unicodedata
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args
 
 import bpy
 
@@ -57,9 +63,21 @@ _CURVE_SUFFIXES = ("_BezierCurve", "_BézierCurve", "_Curve")
 
 _PRESET_ASSIGN = re.compile(r"^\s*op\.([A-Za-z_]\w*)\s*=\s*(.+?)\s*$")
 
+# The values bpy.ops.object.origin_set accepts for center, per the 5.2 docs.
+# A plain assignment rather than a `type` statement: get_args() cannot see
+# through a 3.12+ TypeAliasType, and build_plan() validates against this.
+OriginCenter = Literal['MEDIAN', 'BOUNDS']
+
 
 class PlanError(Exception):
     """A precondition failed. The message is written for the person running it."""
+
+
+class ExportError(PlanError):
+    """execute_plan() failed partway and rolled back what it had created.
+
+    A PlanError subclass so a front-end catching PlanError still reports it.
+    """
 
 
 class WarningCode(Enum):
@@ -69,6 +87,8 @@ class WarningCode(Enum):
     NO_FACES = auto()
     TARGET_EXISTS = auto()
     MISSING_EXPORT_DIR = auto()
+    NAME_SANITIZED = auto()
+    NAME_TAKEN = auto()
 
 
 @dataclass(frozen=True)
@@ -94,7 +114,7 @@ class ExportSettings:
     export_dir: str
     export_collection: str = "Export"
     name_override: str = ""
-    origin_center: str = 'MEDIAN'
+    origin_center: OriginCenter = 'MEDIAN'
     write_fbx: bool = True
     allow_overwrite: bool = False
 
@@ -110,6 +130,9 @@ class ExportPlan:
     """
 
     source: bpy.types.Object
+    # source.data, narrowed to Curve once in build_plan() so nothing downstream
+    # touches the untyped Object.data union again.
+    curve: bpy.types.Curve
     settings: ExportSettings
     mesh_name: str
     out_path: Path | None
@@ -208,11 +231,48 @@ def evaluated_counts(obj: bpy.types.Object) -> tuple[int, int]:
     """
     depsgraph: bpy.types.Depsgraph = bpy.context.evaluated_depsgraph_get()
     evaluated: bpy.types.Object = obj.evaluated_get(depsgraph)
-    mesh: bpy.types.Mesh = evaluated.to_mesh()
+    mesh = evaluated.to_mesh()
     try:
+        # None for object types with no geometry. The source is always a curve,
+        # which yields a mesh (possibly empty), so this is a guard, not a path.
+        if mesh is None:
+            raise PlanError(f"{obj.name!r} produced no geometry when evaluated.")
         return len(mesh.vertices), len(mesh.polygons)
     finally:
         evaluated.to_mesh_clear()
+
+
+def _require(result: AbstractSet[str], action: str) -> None:
+    """Raise unless an operator call finished.
+
+    AbstractSet rather than set: operators return a set of Literal strings, and
+    set is invariant, so set[str] would reject it.
+
+    bpy.ops reports most failures by returning {'CANCELLED'}, not by raising, so
+    an unchecked call fails silently and the next step runs on bad state.
+    """
+    if 'FINISHED' not in result:
+        raise ExportError(f"{action} did not finish (returned {sorted(result)}).")
+
+
+def _discard(ids: list[bpy.types.ID]) -> None:
+    """Best-effort removal of datablocks a failed run created.
+
+    Never raises: it runs while another exception is propagating, and masking
+    that exception would hide the actual failure.
+    """
+    alive: list[bpy.types.ID] = []
+    for id_block in ids:
+        try:
+            id_block.name  # A freed ID raises ReferenceError on any access.
+        except ReferenceError:
+            continue
+        if id_block not in alive:
+            alive.append(id_block)
+    try:
+        bpy.data.batch_remove(alive)
+    except Exception:
+        pass
 
 
 def select_only(context: bpy.types.Context, obj: bpy.types.Object) -> None:
@@ -235,12 +295,16 @@ def active_curve(context: bpy.types.Context) -> bpy.types.Object | None:
 
 
 def view_layer_collection_names(view_layer: bpy.types.ViewLayer) -> set[str]:
-    """Names of the collections linked into this view layer, excluding the root.
+    """Names of the collections active in this view layer, excluding the root.
 
     Not the same set as bpy.data.collections, which spans the whole file. Linking
     the duplicate into a collection that is absent from this view layer leaves it
     out of view_layer.objects, and select_only() then cannot make it active -- so
     the export target has to come from here.
+
+    Excluded collections (the view layer checkbox) are skipped along with their
+    whole subtree. They still appear in the layer collection tree, but their
+    objects are not in view_layer.objects, so for this purpose they are absent.
 
     The root is excluded deliberately: a scene's master collection is not a member
     of bpy.data.collections, so execute_plan() could not look it up by name.
@@ -249,11 +313,73 @@ def view_layer_collection_names(view_layer: bpy.types.ViewLayer) -> set[str]:
 
     def walk(layer_collection: bpy.types.LayerCollection) -> None:
         for child in layer_collection.children:
+            if child.exclude:
+                continue
             names.add(child.collection.name)
             walk(child)
 
     walk(view_layer.layer_collection)
     return names
+
+
+def collection_blocker(view_layer: bpy.types.ViewLayer, name: str) -> str | None:
+    """Why objects linked into this collection could not be selected, or None.
+
+    Checks the whole chain from the root down, since hiding or locking a parent
+    applies to everything beneath it. execute_plan() also verifies the selection
+    directly after linking; this exists to refuse early, with a readable reason,
+    before anything is created.
+    """
+    def find(
+        layer_collection: bpy.types.LayerCollection,
+        trail: list[bpy.types.LayerCollection],
+    ) -> list[bpy.types.LayerCollection] | None:
+        for child in layer_collection.children:
+            here = [*trail, child]
+            if child.collection.name == name:
+                return here
+            found = find(child, here)
+            if found is not None:
+                return found
+        return None
+
+    chain = find(view_layer.layer_collection, [])
+    if chain is None:
+        return f"Collection {name!r} is not in this view layer."
+
+    for layer_collection in chain:
+        collection = layer_collection.collection
+        if layer_collection.hide_viewport or collection.hide_viewport:
+            return (
+                f"Collection {collection.name!r} is hidden in the viewport, so the "
+                f"generated mesh could not be selected for conversion. Unhide it."
+            )
+        if collection.hide_select:
+            return (
+                f"Collection {collection.name!r} is not selectable, so the "
+                f"generated mesh could not be selected for conversion. Re-enable "
+                f"selection on it in the Outliner."
+            )
+    return None
+
+
+def resolve_export_dir(raw: str) -> Path | None:
+    """The export folder as an absolute path, or None when unset.
+
+    A DIR_PATH property filled from Blender's file browser is stored relative to
+    the .blend ('//..\\exports\\') whenever the Relative Paths preference is on,
+    which is the default. Path() does not understand that prefix -- on Windows
+    '//x' reads as a UNC network share -- so it must go through bpy.path.abspath.
+    """
+    if not raw:
+        return None
+    if raw.startswith("//") and not bpy.data.filepath:
+        raise PlanError(
+            f"Export folder {raw!r} is relative to the .blend file, but this file "
+            f"has never been saved, so there is nothing to resolve it against. "
+            f"Save the file, or choose an absolute folder."
+        )
+    return Path(bpy.path.abspath(raw)).resolve()
 
 
 def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPlan:
@@ -268,8 +394,25 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
             raise PlanError("No active object. Select the source curve.")
         raise PlanError(f"Active object {active.name!r} is a {active.type}, not a CURVE.")
 
+    # Exact class check, not isinstance: TextCurve and SurfaceCurve subclass
+    # Curve. Narrows Object.data for the type checker, which the type string
+    # cannot. Redundant with active_curve() at runtime; that one stays cheap
+    # enough for poll() and draw(), this one is what the plan carries.
+    curve = source.data
+    if type(curve) is not bpy.types.Curve:
+        raise PlanError(f"{source.name!r} has {type(curve).__name__} data, not Curve.")
+
     if not settings.export_collection:
         raise PlanError("No export collection set.")
+
+    # The Literal annotation is not enforced at runtime, and the script front-end
+    # passes a plain string. Checked here so a typo fails at Preview rather than
+    # inside origin_set, after the conversion has already run.
+    if settings.origin_center not in get_args(OriginCenter):
+        raise PlanError(
+            f"origin_center {settings.origin_center!r} must be one of "
+            f"{get_args(OriginCenter)}."
+        )
 
     # Stronger than an existence check in bpy.data: anything in the view layer is
     # in bpy.data.collections, but not the reverse.
@@ -279,6 +422,9 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
             f"An object linked there would not be selectable, so the export would "
             f"fail partway through."
         )
+    blocker = collection_blocker(context.view_layer, settings.export_collection)
+    if blocker is not None:
+        raise PlanError(blocker)
 
     if settings.write_fbx and not hasattr(bpy.ops.export_scene, "fbx"):
         raise PlanError("FBX export is unavailable. Enable the FBX format extension.")
@@ -294,18 +440,54 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
         preset_path = find_preset()
         preset_kwargs, unparsed, stale_path = load_preset_kwargs(preset_path)
 
-    mesh_name = settings.name_override or derive_export_name(source.name)
+    warnings: list[PlanWarning] = []
+
+    # The override is sanitized too. It becomes a filename, so unsanitized it
+    # could carry an Unreal-hostile dot, a Windows-invalid character, or a '..\'
+    # that writes outside the export folder.
+    if settings.name_override:
+        mesh_name = sanitize_for_unreal(settings.name_override)
+        if mesh_name != settings.name_override:
+            warnings.append(PlanWarning(
+                WarningCode.NAME_SANITIZED,
+                f"Name override {settings.name_override!r} was sanitized to "
+                f"{mesh_name!r}.",
+            ))
+    else:
+        mesh_name = derive_export_name(source.name)
+
+    # Blender resolves a name clash by renaming the new object, so the mesh --
+    # and the object inside the FBX -- would silently get a numbered suffix.
+    existing = bpy.data.objects.get(mesh_name)
+    if existing is not None:
+        if existing == source:
+            detail = (
+                f"The source curve is itself named {mesh_name!r}, so the new mesh "
+                f"will get a numbered name like '{mesh_name}.001'. Rename the curve "
+                f"(e.g. {mesh_name}_BezierCurve) or set a name override."
+            )
+        else:
+            detail = (
+                f"An object named {mesh_name!r} already exists, likely an earlier "
+                f"export, so the new mesh will get a numbered name like "
+                f"'{mesh_name}.001'. Delete or rename the old one first."
+            )
+        warnings.append(PlanWarning(
+            WarningCode.NAME_TAKEN,
+            f"{detail} The FBX file is still named {mesh_name}.fbx, but the "
+            f"object inside it carries the numbered name.",
+        ))
 
     # None only when export_dir is empty, which the write_fbx guard above already
     # rules out for any plan that will actually write a file. When write_fbx is
     # False but a directory is set, this still reports where the file would land.
+    export_dir = resolve_export_dir(settings.export_dir)
     out_path: Path | None = (
-        Path(settings.export_dir) / f"{mesh_name}.fbx" if settings.export_dir else None
+        export_dir / f"{mesh_name}.fbx" if export_dir is not None else None
     )
     verts, polys = evaluated_counts(source)
     units = context.scene.unit_settings
 
-    warnings: list[PlanWarning] = []
     if polys == 0:
         warnings.append(PlanWarning(
             WarningCode.NO_FACES,
@@ -334,6 +516,7 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
 
     return ExportPlan(
         source=source,
+        curve=curve,
         settings=settings,
         mesh_name=mesh_name,
         out_path=out_path,
@@ -384,32 +567,85 @@ def execute_plan(context: bpy.types.Context, plan: ExportPlan) -> ExportResult:
     ]
 
     duplicate: bpy.types.Object = source.copy()
-    duplicate.data = source.data.copy()
+    curve_copy = plan.curve.copy()
+    duplicate.data = curve_copy
     duplicate.name = plan.mesh_name
-    export_collection.objects.link(duplicate)
 
-    select_only(context, duplicate)
-    bpy.ops.object.convert(target='MESH')
+    # Everything this run creates, so a failure can remove it. All or nothing: a
+    # half-converted duplicate left in the Export collection would be picked up
+    # by the next run's name-clash check, or exported by hand as if it were good.
+    created: list[bpy.types.ID] = [duplicate, curve_copy]
+    created_file = False
+    try:
+        export_collection.objects.link(duplicate)
 
-    # Order matters: convert first so the curve geometry and Solidify bake into
-    # real vertices, then apply rot/scale on the resulting mesh. Applying the
-    # transform to the curve beforehand rescales control points and reinterprets
-    # bevel depth, which deforms the ramp.
-    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
-    bpy.ops.object.origin_set(type='ORIGIN_GEOMETRY', center=settings.origin_center)
-    duplicate.location = (0.0, 0.0, 0.0)
-    duplicate.data.name = plan.mesh_name
-
-    written: Path | None = None
-    if settings.write_fbx and out_path is not None:
         select_only(context, duplicate)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        bpy.ops.export_scene.fbx(filepath=str(out_path), **plan.preset_kwargs)
-        written = out_path
+        if not duplicate.select_get() or context.view_layer.objects.active != duplicate:
+            raise ExportError(
+                f"Could not select the duplicate in {settings.export_collection!r}; "
+                f"the collection may be hidden or locked."
+            )
+
+        _require(bpy.ops.object.convert(target='MESH'), "Convert to mesh")
+        # convert can finish having converted nothing. Carrying on with a curve
+        # would apply the transform to it -- the deformation the ordering below
+        # exists to avoid -- and then export the curve as if it were the mesh.
+        # The exact class check also narrows duplicate.data for what follows.
+        mesh = duplicate.data
+        if type(mesh) is not bpy.types.Mesh:
+            raise ExportError(
+                f"Conversion left {duplicate.name!r} as a {duplicate.type}, not a MESH."
+            )
+        created.append(mesh)
+
+        # Order matters: convert first so the curve geometry and Solidify bake
+        # into real vertices, then apply rot/scale on the resulting mesh. Applying
+        # the transform to the curve beforehand rescales control points and
+        # reinterprets bevel depth, which deforms the ramp.
+        _require(
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=True),
+            "Apply rotation and scale",
+        )
+        _require(
+            bpy.ops.object.origin_set(
+                type='ORIGIN_GEOMETRY', center=settings.origin_center
+            ),
+            "Origin to geometry",
+        )
+        duplicate.location = (0.0, 0.0, 0.0)
+        # transform_apply and origin_set edit single-user data in place, so this
+        # is still the mesh convert produced.
+        mesh.name = plan.mesh_name
+
+        written: Path | None = None
+        if settings.write_fbx and out_path is not None:
+            select_only(context, duplicate)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            created_file = not plan.target_exists
+            _require(
+                bpy.ops.export_scene.fbx(filepath=str(out_path), **plan.preset_kwargs),
+                "FBX export",
+            )
+            if not out_path.is_file():
+                raise ExportError(f"FBX export reported success but wrote no {out_path}.")
+            written = out_path
+    except Exception as exc:
+        _discard(created)
+        # Only a file this run created is removed. An overwritten one cannot be
+        # restored -- which is why overwriting is a separate opt-in.
+        if created_file and out_path is not None:
+            try:
+                out_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ExportError(
+            f"{exc} The partially built mesh was removed (the selection was not "
+            f"restored)."
+        ) from exc
 
     return ExportResult(
         mesh_object_name=duplicate.name,
-        verts=len(duplicate.data.vertices),
-        polys=len(duplicate.data.polygons),
+        verts=len(mesh.vertices),
+        polys=len(mesh.polygons),
         fbx_path=written,
     )

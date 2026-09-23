@@ -13,6 +13,12 @@ WHAT IT DOES
     rim. Most columns sit in the middle of a straight run of the profile and
     carry no shape -- dissolving their lengthwise edge loops loses nothing.
 
+    With Solidify, each end of the ramp is also capped by a strip of rim quads
+    joining the two shells' end rows. The rim edges of that strip that fall in a
+    redundant column are dissolved too. Without that, an end-row vertex keeps its
+    rim edge, stays 3-valent after its lengthwise edge goes, and survives --
+    2 shells x (dissolved columns) stray vertices at each end.
+
     Columns are classified by the angle the profile turns through at them. A
     column whose incoming and outgoing directions are collinear within
     angle_threshold is redundant. Boundary columns are always kept.
@@ -32,6 +38,17 @@ STATUS
     successfully the same day on that mesh: 2134 -> 804 verts, 2132 -> 788 faces,
     1344 edges dissolved, via both the cli front-end and the panel. The angle
     detector selected {0, 2, 8, 10}, matching the hand-picked set.
+
+    Run again 2026-09-23 on InnerRearRamp.001 at width 7 (keep {0, 1, 5, 6}):
+    1358 -> 788 verts, which left the end rows full width -- 2 shells x 3
+    dissolved columns = 6 stray vertices at each end. The vertex prediction had
+    been corrected to match those leftovers rather than to remove them.
+
+    Fixed and tested in Blender 2026-09-23: end-cap rim edges in redundant columns are now
+    dissolved too, and rim edges count toward grid confidence (that mesh read
+    92.5% only because its 204 rim edges were uncounted; with them, 100%). On the
+    same mesh expect 576 + 6 = 582 edges dissolved and 2 x 97 x 4 = 776 verts.
+    Also refuses multi-user and library-linked mesh data.
 """
 
 import math
@@ -52,6 +69,8 @@ class WarningCode(Enum):
     NOTHING_TO_DISSOLVE = auto()
     KEEPS_EVERY_COLUMN = auto()
     LOW_GRID_CONFIDENCE = auto()
+    SHARED_DATA = auto()
+    LINKED_DATA = auto()
 
 
 @dataclass(frozen=True)
@@ -106,12 +125,18 @@ class GridModel:
 @dataclass
 class SimplifyPlan:
     source: bpy.types.Object
+    # source.data, narrowed to Mesh once in build_simplify_plan() so nothing
+    # downstream touches the untyped Object.data union again.
+    mesh: bpy.types.Mesh
     settings: SimplifySettings
     grid: GridModel
     keep_columns: tuple[int, ...]
     dissolve_columns: tuple[int, ...]
     column_angles_deg: tuple[float, ...]
+    # Total, lengthwise plus end-cap rim. The rim share is reported separately
+    # because it is checkable by hand in a dry run: 2 ends x dissolved columns.
     edges_to_dissolve: int
+    rim_edges_to_dissolve: int
     predicted_verts: int
     warnings: list[SimplifyWarning] = field(default_factory=list)
 
@@ -131,15 +156,15 @@ class SimplifyResult:
 
 # -------------------------------------------------------------------- helpers
 
-def _open_bmesh(obj: bpy.types.Object) -> tuple[bmesh.types.BMesh, bool]:
-    """A bmesh for the object, plus whether it is the live edit-mode one.
+def _open_bmesh(mesh: bpy.types.Mesh) -> tuple[bmesh.types.BMesh, bool]:
+    """A bmesh for the mesh, plus whether it is the live edit-mode one.
 
     The caller must not free a live edit bmesh; Blender owns it.
     """
     if bpy.context.mode == 'EDIT_MESH':
-        return bmesh.from_edit_mesh(obj.data), True
+        return bmesh.from_edit_mesh(mesh), True
     bm = bmesh.new()
-    bm.from_mesh(obj.data)
+    bm.from_mesh(mesh)
     return bm, False
 
 
@@ -149,6 +174,10 @@ def recover_grid(bm: bmesh.types.BMesh, min_confidence: float) -> GridModel:
     In a row-major grid every edge joins indices differing by 1 (across the
     profile), by W (along the length), or by the shell stride (the Solidify rim).
     The dominant non-1 delta is W.
+
+    Rim edges count toward confidence once a second shell is found. Leaving them
+    out made every solidified mesh read below the 95% warning line -- a warning
+    that always fires is one nobody reads.
     """
     bm.verts.index_update()
     bm.edges.index_update()
@@ -165,7 +194,13 @@ def recover_grid(bm: bmesh.types.BMesh, min_confidence: float) -> GridModel:
     if width < 3:
         raise SimplifyError(f"Recovered width {width} is too small to simplify.")
 
+    # The next-largest delta is the shell stride if Solidify welded two shells.
+    stride = non_unit[1] if len(non_unit) > 1 else vert_count
+    shells = max(1, round(vert_count / stride)) if stride else 1
+
     explained = deltas.get(1, 0) + deltas.get(width, 0)
+    if shells > 1:
+        explained += deltas.get(stride, 0)
     confidence = explained / edge_count
     if confidence < min_confidence:
         raise SimplifyError(
@@ -174,9 +209,6 @@ def recover_grid(bm: bmesh.types.BMesh, min_confidence: float) -> GridModel:
             f"column arithmetic assumes; refusing rather than guessing."
         )
 
-    # The next-largest delta is the shell stride if Solidify welded two shells.
-    stride = non_unit[1] if len(non_unit) > 1 else vert_count
-    shells = max(1, round(vert_count / stride)) if stride else 1
     if shells > 1 and stride % width != 0:
         raise SimplifyError(
             f"Shell stride {stride} is not a multiple of width {width}, so a "
@@ -233,10 +265,13 @@ def build_simplify_plan(
     obj = context.active_object
     if obj is None:
         raise SimplifyError("No active object. Select the converted mesh.")
-    if obj.type != 'MESH':
+    # Exact class check: narrows Object.data for the type checker, which the type
+    # string cannot, and is the one check this repo uses for every data type.
+    mesh = obj.data
+    if type(mesh) is not bpy.types.Mesh:
         raise SimplifyError(f"Active object {obj.name!r} is a {obj.type}, not a MESH.")
 
-    bm, is_live = _open_bmesh(obj)
+    bm, is_live = _open_bmesh(mesh)
     try:
         grid = recover_grid(bm, settings.min_grid_confidence)
         angles = profile_turn_angles(bm, grid)
@@ -256,9 +291,10 @@ def build_simplify_plan(
 
         dissolve = tuple(c for c in range(grid.width) if c not in keep)
 
-        # Lengthwise edges in the doomed columns, across every shell. Counted
-        # here so the dry run can report it without touching anything.
-        doomed = _lengthwise_edges(bm, grid, dissolve)
+        # Every edge that will go, counted here so the dry run can report it
+        # without touching anything.
+        rim = _end_rim_edges(bm, grid, dissolve)
+        doomed = _lengthwise_edges(bm, grid, dissolve) + rim
 
         warnings: list[SimplifyWarning] = []
         if not dissolve:
@@ -274,6 +310,26 @@ def build_simplify_plan(
                 "Keep set covers the whole profile; nothing would change.",
                 blocking=True,
             ))
+        # This edits the mesh in place, so anything else holding it would change
+        # too. Blocking warnings rather than errors so a dry run still reports
+        # the full analysis.
+        if not mesh.is_editable:
+            warnings.append(SimplifyWarning(
+                WarningCode.LINKED_DATA,
+                f"Mesh {mesh.name!r} is linked from a library and cannot be "
+                f"edited in this file.",
+                blocking=True,
+            ))
+        # A fake user is a user count with no one behind it; it shares nothing.
+        sharers = mesh.users - int(mesh.use_fake_user)
+        if sharers > 1:
+            warnings.append(SimplifyWarning(
+                WarningCode.SHARED_DATA,
+                f"Mesh {mesh.name!r} has {sharers} users, so dissolving it in place "
+                f"would change every one of them. Make it single-user first "
+                f"(Object > Relations > Make Single User).",
+                blocking=True,
+            ))
         if grid.confidence < 0.95:
             warnings.append(SimplifyWarning(
                 WarningCode.LOW_GRID_CONFIDENCE,
@@ -281,27 +337,24 @@ def build_simplify_plan(
                 f"result; anything below ~95% means unexpected topology.",
             ))
 
-        # The two end rows keep their full width. A vertex in a dissolved column
-        # normally drops to 2 edges once its lengthwise pair goes, so use_verts
-        # removes it -- but an end-row vertex also carries a rim edge (or, with
-        # no Solidify, sits on the open boundary), leaving it 3-valent and alive.
+        # Every row, end rows included, keeps only the kept columns: with its
+        # end-cap rim edge dissolved as well, an end-row vertex in a dissolved
+        # column drops to 2 edges like any other, and use_verts removes it.
         #
-        # Corrected 2026-09-22 against a live run: the old shells*rows*len(keep)
-        # form predicted 776 where the mesh came out at 804, short by exactly
-        # 7 dissolved columns x 2 end rows x 2 shells.
-        interior_rows = max(0, grid.rows - 2)
-        end_rows = min(2, grid.rows)
-        predicted = grid.shells * (
-            interior_rows * len(keep) + end_rows * grid.width
-        )
+        # Unverified for a single shell (no Solidify, so no rim): there the
+        # end-row vertex sits on an open boundary and is assumed to dissolve at
+        # 2 edges too. Compare this against the result on the first such run.
+        predicted = grid.shells * grid.rows * len(keep)
         return SimplifyPlan(
             source=obj,
+            mesh=mesh,
             settings=settings,
             grid=grid,
             keep_columns=keep,
             dissolve_columns=dissolve,
             column_angles_deg=angles,
             edges_to_dissolve=len(doomed),
+            rim_edges_to_dissolve=len(rim),
             predicted_verts=predicted,
             warnings=warnings,
         )
@@ -329,6 +382,30 @@ def _lengthwise_edges(
     return found
 
 
+def _end_rim_edges(
+    bm: bmesh.types.BMesh, grid: GridModel, columns: tuple[int, ...]
+) -> list[bmesh.types.BMEdge]:
+    """Solidify rim edges capping each end of the ramp, within the given columns.
+
+    A rim edge joins a vertex to its twin on the other shell, so its index delta
+    is exactly the shell stride. Rim edges also run down both long sides, but
+    those sit in the boundary columns -- excluded explicitly rather than trusted
+    to the keep set, since keep_columns_override can leave a boundary column out
+    and dissolving a side rim would open the solid along its whole length.
+    """
+    if grid.shells < 2:
+        return []
+    wanted = set(columns) - {0, grid.width - 1}
+    found = []
+    for edge in bm.edges:
+        a, b = edge.verts[0].index, edge.verts[1].index
+        if abs(a - b) != grid.shell_stride:
+            continue
+        if grid.column_of(min(a, b)) in wanted:
+            found.append(edge)
+    return found
+
+
 def execute_simplify_plan(
     context: bpy.types.Context, plan: SimplifyPlan
 ) -> SimplifyResult:
@@ -338,8 +415,8 @@ def execute_simplify_plan(
             "; ".join(w.message for w in plan.blocking_warnings)
         )
 
-    obj = plan.source
-    bm, is_live = _open_bmesh(obj)
+    mesh = plan.mesh
+    bm, is_live = _open_bmesh(mesh)
     try:
         # Rebuilt rather than reusing the plan's bmesh: that one was opened for
         # reading and, outside edit mode, has already been freed.
@@ -351,7 +428,10 @@ def execute_simplify_plan(
             )
 
         verts_before, faces_before = len(bm.verts), len(bm.faces)
-        doomed = _lengthwise_edges(bm, grid, plan.dissolve_columns)
+        doomed = (
+            _lengthwise_edges(bm, grid, plan.dissolve_columns)
+            + _end_rim_edges(bm, grid, plan.dissolve_columns)
+        )
 
         # One call, after collecting every edge: indices shift as soon as
         # anything is removed, so a second pass would address the wrong geometry.
@@ -366,10 +446,10 @@ def execute_simplify_plan(
         )
 
         if is_live:
-            bmesh.update_edit_mesh(obj.data)
+            bmesh.update_edit_mesh(mesh)
         else:
-            bm.to_mesh(obj.data)
-            obj.data.update()
+            bm.to_mesh(mesh)
+            mesh.update()
         return result
     finally:
         if not is_live:

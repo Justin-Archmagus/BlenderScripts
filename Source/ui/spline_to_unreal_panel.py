@@ -60,6 +60,9 @@ from bpy.props import (
 from bpy.types import Collection, Context, Object, Operator, Panel, PropertyGroup
 
 if TYPE_CHECKING:
+    # Stub-only module from fake-bpy-module; it does not exist inside Blender,
+    # so every use of it must stay in a quoted annotation.
+    from bpy.stub_internal.rna_enums import OperatorReturnItems
     from mesh_simplify_core import SimplifyPlan, SimplifySettings
     from spline_export_core import ExportPlan, ExportSettings
 
@@ -80,6 +83,16 @@ SIMPLIFY_SCENE_PROP = "pinball_simplify"
 
 _modules: dict[str, ModuleType] = {}
 
+# Blender declares RNA properties as `name: StringProperty(...)`. That is a call
+# expression, not a type, so Pyright reports it as an invalid type form. The
+# syntax is Blender's and correct here; silence the check for this file only.
+# pyright: reportInvalidTypeForm=false
+
+# The 5.2 stubs declare the context of Operator.poll/execute and Panel.poll/draw
+# as `Context | None`, while documenting it "(never None)". Overrides match the
+# declared signature, since an override may not narrow a parameter, and assert
+# the documented guarantee on their first line. Matching rather than suppressing
+# keeps the override check alive for return types.
 
 # ------------------------------------------------------------------ bootstrap
 
@@ -294,15 +307,20 @@ class PINBALL_OT_spline_preview(Operator):
     bl_options = {'REGISTER'}
 
     @classmethod
-    def poll(cls, context: Context) -> bool:
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
         return context.mode == 'OBJECT' and _active_curve(context) is not None
 
-    def execute(self, context: Context) -> set[str]:
-        core = _get_core()
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
         props = _props(context)
         try:
+            core = _get_core()
             plan = core.build_plan(context, _settings_from(core, props))
-        except core.PlanError as exc:
+        except Exception as exc:
+            # Broad on purpose, as in the simplify operators: a PlanError, a failed
+            # module load, or an OSError reading the preset all belong in the
+            # status bar, not as a traceback in a hidden console.
             props.preview_valid = False
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -321,7 +339,8 @@ class PINBALL_OT_spline_export(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
-    def poll(cls, context: Context) -> bool:
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
         props = _props(context)
         return (
             context.mode == 'OBJECT'
@@ -331,15 +350,19 @@ class PINBALL_OT_spline_export(Operator):
             and not _is_stale(context, props)
         )
 
-    def execute(self, context: Context) -> set[str]:
-        core = _get_core()
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
         props = _props(context)
         try:
+            core = _get_core()
             # Rebuilt rather than reused: the cache is a display projection, and
             # the scene may have changed since Preview ran.
             plan = core.build_plan(context, _settings_from(core, props))
             result = core.execute_plan(context, plan)
-        except core.PlanError as exc:
+        except Exception as exc:
+            # execute_plan() rolls back its own partial mesh before raising, so
+            # reporting is all that is left to do here.
+            props.preview_valid = False
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
@@ -361,10 +384,15 @@ class PINBALL_PT_spline_export(Panel):
     bl_region_type = 'UI'
     bl_category = "Pinball"
 
-    def draw(self, context: Context) -> None:
+    def draw(self, context: Context | None) -> None:
+        assert context is not None
         # Cheap reads only. build_plan() evaluates the depsgraph and must never
         # be called from here -- draw() runs on every redraw.
         layout = self.layout
+        # RNA types Panel.layout as optional because it only exists while the
+        # panel is drawing. Inside draw() it always does; state that for the
+        # type checker rather than guarding a case that cannot happen.
+        assert layout is not None
         props = _props(context)
         curve = _active_curve(context)
 
@@ -530,10 +558,12 @@ class PINBALL_OT_simplify_preview(Operator):
     bl_options = {'REGISTER'}
 
     @classmethod
-    def poll(cls, context: Context) -> bool:
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
         return _active_mesh(context) is not None
 
-    def execute(self, context: Context) -> set[str]:
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
         props = _simplify_props(context)
         try:
             core = _get_simplify()
@@ -567,7 +597,8 @@ class PINBALL_OT_simplify_apply(Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
-    def poll(cls, context: Context) -> bool:
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
         props = _simplify_props(context)
         return (
             _active_mesh(context) is not None
@@ -576,7 +607,8 @@ class PINBALL_OT_simplify_apply(Operator):
             and not _simplify_is_stale(context, props)
         )
 
-    def execute(self, context: Context) -> set[str]:
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
         props = _simplify_props(context)
         try:
             core = _get_simplify()
@@ -602,10 +634,12 @@ class PINBALL_PT_simplify(Panel):
     bl_region_type = 'UI'
     bl_category = "Pinball"
 
-    def draw(self, context: Context) -> None:
+    def draw(self, context: Context | None) -> None:
+        assert context is not None
         # Cheap reads only. build_simplify_plan() walks every edge and must never
         # be called from here.
         layout = self.layout
+        assert layout is not None  # See PINBALL_PT_spline_export.draw.
         props = _simplify_props(context)
         mesh = _active_mesh(context)
 
