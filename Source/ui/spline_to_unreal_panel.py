@@ -38,7 +38,9 @@ DO NOT ADD `from __future__ import annotations` TO THIS FILE
     is not.
 
 STATUS
-    First draft, never run. Registration in particular is unverified.
+    Registered and exercised 2026-09-22. Both panels appear in the Pinball tab,
+    and both operator pairs have been run: Preview -> Convert & Export, and
+    Analyze -> Simplify.
 """
 
 from pathlib import Path
@@ -50,6 +52,7 @@ from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
+    FloatProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -57,6 +60,7 @@ from bpy.props import (
 from bpy.types import Collection, Context, Object, Operator, Panel, PropertyGroup
 
 if TYPE_CHECKING:
+    from mesh_simplify_core import SimplifyPlan, SimplifySettings
     from spline_export_core import ExportPlan, ExportSettings
 
 # The core lives in Source/lib, a sibling of this file's folder (Source/ui).
@@ -68,22 +72,24 @@ CORE_DIR_NAME = "lib"
 # the repo works wherever it is checked out.
 CORE_DIR_FALLBACK = r"D:\dev\Blender\Scripts\BlenderScripts\Source\lib"
 
-CORE_MODULE = "spline_export_core"
+EXPORT_MODULE = "spline_export_core"
+SIMPLIFY_MODULE = "mesh_simplify_core"
 
 SCENE_PROP = "pinball_spline_export"
+SIMPLIFY_SCENE_PROP = "pinball_simplify"
 
-_core: ModuleType | None = None
+_modules: dict[str, ModuleType] = {}
 
 
 # ------------------------------------------------------------------ bootstrap
 
-def _load_core() -> ModuleType:
-    """Import spline_export_core from this script's folder.
+def _load_module(module_name: str) -> ModuleType:
+    """Import a core module from the sibling lib folder.
 
-    Duplicated from spline_to_unreal_mesh.py on purpose: it is the code that
-    makes importing possible, so it cannot itself be imported. Packaging both
-    front-ends as an extension would replace this with a relative import and
-    delete the duplication -- worth doing once the design settles.
+    Duplicated from the cli front-ends on purpose: it is the code that makes
+    importing possible, so it cannot itself be imported. Packaging the front-ends
+    as an extension would replace this with a relative import and delete the
+    duplication -- worth doing once the design settles.
     """
     import importlib
     import sys
@@ -99,32 +105,49 @@ def _load_core() -> ModuleType:
     candidates.append(Path(CORE_DIR_FALLBACK))
 
     for folder in candidates:
-        if (folder / f"{CORE_MODULE}.py").is_file():
+        if (folder / f"{module_name}.py").is_file():
             if str(folder) not in sys.path:
                 sys.path.append(str(folder))
-            return importlib.reload(importlib.import_module(CORE_MODULE))
+            return importlib.reload(importlib.import_module(module_name))
 
     raise RuntimeError(
-        f"Could not find {CORE_MODULE}.py. Looked in: "
+        f"Could not find {module_name}.py. Looked in: "
         f"{[str(c) for c in candidates]}. Fix CORE_DIR_FALLBACK."
     )
 
 
+def _get_module(module_name: str) -> ModuleType:
+    """Cached loader. The cache is module-level, so re-running this script from
+    the Text Editor resets it and picks up core edits."""
+    if module_name not in _modules:
+        _modules[module_name] = _load_module(module_name)
+    return _modules[module_name]
+
+
 def _get_core() -> ModuleType:
-    global _core
-    if _core is None:
-        _core = _load_core()
-    return _core
+    return _get_module(EXPORT_MODULE)
 
 
-def _active_curve(context: Context) -> Object | None:
+def _get_simplify() -> ModuleType:
+    return _get_module(SIMPLIFY_MODULE)
+
+
+def _active_of_type(context: Context, type_name: str) -> Object | None:
     """Local copy of the core helper.
 
     poll() and draw() run on every redraw, so they must not touch the dynamic
     import. Two lines of duplication buys that.
     """
     obj = context.active_object
-    return obj if obj is not None and obj.type == 'CURVE' else None
+    return obj if obj is not None and obj.type == type_name else None
+
+
+def _active_curve(context: Context) -> Object | None:
+    return _active_of_type(context, 'CURVE')
+
+
+def _active_mesh(context: Context) -> Object | None:
+    return _active_of_type(context, 'MESH')
 
 
 def _poll_export_collection(self: PropertyGroup, collection: Collection) -> bool:
@@ -146,12 +169,13 @@ def _poll_export_collection(self: PropertyGroup, collection: Collection) -> bool
 
 # ------------------------------------------------------------------- ui state
 
-class PINBALL_PG_spline_warning(PropertyGroup):
-    """One warning from the last preview.
+class PINBALL_PG_warning(PropertyGroup):
+    """One warning from the last preview, from either core.
 
-    A CollectionProperty cannot hold a dataclass, so core's PlanWarning is
-    flattened into RNA here. The blocking flag survives, which is what the panel
-    needs to pick an icon and refuse to export.
+    A CollectionProperty cannot hold a dataclass, so PlanWarning and
+    SimplifyWarning are both flattened into RNA here. They have the same shape,
+    and the blocking flag survives -- which is what the panels need to pick an
+    icon and refuse to run.
     """
 
     message: StringProperty(name="Message")
@@ -212,7 +236,7 @@ class PINBALL_PG_spline_export(PropertyGroup):
     preview_verts: IntProperty()
     preview_polys: IntProperty()
     preview_blocked: BoolProperty(default=False)
-    preview_warnings: CollectionProperty(type=PINBALL_PG_spline_warning)
+    preview_warnings: CollectionProperty(type=PINBALL_PG_warning)
 
 
 def _props(context: Context) -> PINBALL_PG_spline_export:
@@ -393,33 +417,276 @@ class PINBALL_PT_spline_export(Panel):
         layout.operator(PINBALL_OT_spline_export.bl_idname, icon='EXPORT')
 
 
+# ------------------------------------------------------------- simplify state
+
+class PINBALL_PG_simplify(PropertyGroup):
+    """Simplify inputs plus a cached projection of the last analysis.
+
+    Same discipline as the export group: plain values only, never the
+    SimplifyPlan, which holds a live object reference.
+    """
+
+    angle_threshold_deg: FloatProperty(
+        name="Angle Threshold",
+        description="Profile turn below this many degrees counts as collinear, "
+                    "so that column carries no shape and is redundant",
+        default=1.0, min=0.0, max=180.0, soft_max=45.0, precision=3,
+    )
+    min_grid_confidence: FloatProperty(
+        name="Min Grid Confidence",
+        description="Refuse if the row-major grid model explains less than this "
+                    "share of the mesh's edges",
+        default=0.90, min=0.0, max=1.0,
+    )
+    use_column_override: BoolProperty(
+        name="Override Columns",
+        description="Ignore angle detection and keep exactly the columns listed",
+        default=False,
+    )
+    column_override: StringProperty(
+        name="Keep",
+        description="Comma-separated 0-based column indices, e.g. 0,2,8,10",
+        default="",
+    )
+
+    # --- cached analysis, for display only
+    preview_valid: BoolProperty(default=False)
+    preview_source: StringProperty()
+    preview_width: IntProperty()
+    preview_rows: IntProperty()
+    preview_shells: IntProperty()
+    preview_confidence: FloatProperty()
+    preview_keep: StringProperty()
+    preview_dissolve: StringProperty()
+    preview_edges_hit: IntProperty()
+    preview_verts_before: IntProperty()
+    preview_verts_after: IntProperty()
+    preview_blocked: BoolProperty(default=False)
+    preview_warnings: CollectionProperty(type=PINBALL_PG_warning)
+
+
+def _simplify_props(context: Context) -> PINBALL_PG_simplify:
+    return getattr(context.scene, SIMPLIFY_SCENE_PROP)
+
+
+def _parse_columns(text: str) -> tuple[int, ...]:
+    """Parse '0,2,8,10' into a tuple. Raises ValueError on anything else, which
+    the operator turns into a UI error rather than a console traceback."""
+    cleaned = text.replace(" ", "")
+    if not cleaned:
+        return ()
+    return tuple(int(part) for part in cleaned.split(",") if part)
+
+
+def _simplify_settings(
+    core: ModuleType, props: PINBALL_PG_simplify
+) -> "SimplifySettings":
+    override = (
+        _parse_columns(props.column_override) if props.use_column_override else ()
+    )
+    return core.SimplifySettings(
+        angle_threshold_deg=props.angle_threshold_deg,
+        keep_columns_override=override,
+        min_grid_confidence=props.min_grid_confidence,
+    )
+
+
+def _store_simplify_preview(
+    props: PINBALL_PG_simplify, plan: "SimplifyPlan"
+) -> None:
+    props.preview_warnings.clear()
+    for warning in plan.warnings:
+        item = props.preview_warnings.add()
+        item.message = warning.message
+        item.blocking = warning.blocking
+
+    grid = plan.grid
+    props.preview_source = plan.source.name
+    props.preview_width = grid.width
+    props.preview_rows = grid.rows
+    props.preview_shells = grid.shells
+    props.preview_confidence = grid.confidence
+    props.preview_keep = ", ".join(str(c) for c in plan.keep_columns)
+    props.preview_dissolve = ", ".join(str(c) for c in plan.dissolve_columns)
+    props.preview_edges_hit = plan.edges_to_dissolve
+    props.preview_verts_before = grid.verts
+    props.preview_verts_after = plan.predicted_verts
+    props.preview_blocked = bool(plan.blocking_warnings)
+    props.preview_valid = True
+
+
+def _simplify_is_stale(context: Context, props: PINBALL_PG_simplify) -> bool:
+    obj = context.active_object
+    return props.preview_source != (obj.name if obj is not None else "")
+
+
+# --------------------------------------------------------- simplify operators
+
+class PINBALL_OT_simplify_preview(Operator):
+    bl_idname = "pinball.simplify_preview"
+    bl_label = "Analyze"
+    bl_description = "Recover the grid and report which profile columns are redundant"
+    # No UNDO: writes only the analysis cache.
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        return _active_mesh(context) is not None
+
+    def execute(self, context: Context) -> set[str]:
+        props = _simplify_props(context)
+        try:
+            core = _get_simplify()
+            plan = core.build_simplify_plan(context, _simplify_settings(core, props))
+        except ValueError as exc:
+            props.preview_valid = False
+            self.report({'ERROR'}, f"Bad column list: {exc}")
+            return {'CANCELLED'}
+        except Exception as exc:
+            # Broad on purpose: a SimplifyError or a failed module load both
+            # belong in the status bar, not as a traceback in a hidden console.
+            props.preview_valid = False
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        _store_simplify_preview(props, plan)
+        self.report(
+            {'INFO'},
+            f"width {plan.grid.width}: keep {list(plan.keep_columns)}, "
+            f"{plan.grid.verts} -> {plan.predicted_verts} verts",
+        )
+        return {'FINISHED'}
+
+
+class PINBALL_OT_simplify_apply(Operator):
+    bl_idname = "pinball.simplify_apply"
+    bl_label = "Simplify"
+    bl_description = "Dissolve the redundant profile columns. Edits the mesh in place"
+    # UNDO matters more here than for the export: this edits in place with no
+    # duplicate, so Ctrl+Z is the only way back.
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context) -> bool:
+        props = _simplify_props(context)
+        return (
+            _active_mesh(context) is not None
+            and props.preview_valid
+            and not props.preview_blocked
+            and not _simplify_is_stale(context, props)
+        )
+
+    def execute(self, context: Context) -> set[str]:
+        props = _simplify_props(context)
+        try:
+            core = _get_simplify()
+            # Rebuilt rather than reused: the cache is a display projection.
+            plan = core.build_simplify_plan(context, _simplify_settings(core, props))
+            result = core.execute_simplify_plan(context, plan)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        props.preview_valid = False
+        self.report(
+            {'INFO'},
+            f"{result.verts_before} -> {result.verts_after} verts, "
+            f"{result.faces_before} -> {result.faces_after} faces",
+        )
+        return {'FINISHED'}
+
+
+class PINBALL_PT_simplify(Panel):
+    bl_label = "Simplify"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pinball"
+
+    def draw(self, context: Context) -> None:
+        # Cheap reads only. build_simplify_plan() walks every edge and must never
+        # be called from here.
+        layout = self.layout
+        props = _simplify_props(context)
+        mesh = _active_mesh(context)
+
+        header = layout.box()
+        if mesh is None:
+            header.label(text="Select a converted mesh", icon='ERROR')
+        else:
+            header.label(text=mesh.name, icon='OUTLINER_OB_MESH')
+
+        col = layout.column()
+        col.prop(props, "use_column_override")
+        if props.use_column_override:
+            col.prop(props, "column_override")
+        else:
+            col.prop(props, "angle_threshold_deg")
+        col.prop(props, "min_grid_confidence")
+
+        layout.separator()
+        layout.operator(PINBALL_OT_simplify_preview.bl_idname, icon='VIEWZOOM')
+
+        if props.preview_valid:
+            if _simplify_is_stale(context, props):
+                layout.label(text="Selection changed, analyze again",
+                             icon='FILE_REFRESH')
+            else:
+                box = layout.box()
+                box.label(
+                    text=f"{props.preview_width} wide x {props.preview_rows} long"
+                         f" x {props.preview_shells} shells",
+                    icon='MESH_GRID',
+                )
+                box.label(text=f"grid confidence {props.preview_confidence:.1%}")
+                box.label(text=f"keep {props.preview_keep}", icon='CHECKMARK')
+                box.label(text=f"dissolve {props.preview_dissolve}", icon='X')
+                box.label(text=f"{props.preview_verts_before} -> "
+                               f"{props.preview_verts_after} verts")
+                for warning in props.preview_warnings:
+                    box.label(
+                        text=warning.message,
+                        icon='CANCEL' if warning.blocking else 'ERROR',
+                    )
+
+        # poll() greys this out on its own.
+        layout.operator(PINBALL_OT_simplify_apply.bl_idname, icon='MOD_DECIM')
+
+
 # --------------------------------------------------------------- registration
 
-# Order matters: PINBALL_PG_spline_warning must register before the group whose
+# Order matters: PINBALL_PG_warning must register before either group whose
 # CollectionProperty points at it. The factory unregisters in reverse.
 _CLASSES = (
-    PINBALL_PG_spline_warning,
+    PINBALL_PG_warning,
     PINBALL_PG_spline_export,
+    PINBALL_PG_simplify,
     PINBALL_OT_spline_preview,
     PINBALL_OT_spline_export,
+    PINBALL_OT_simplify_preview,
+    PINBALL_OT_simplify_apply,
     PINBALL_PT_spline_export,
+    PINBALL_PT_simplify,
 )
 
 _register_classes, _unregister_classes = bpy.utils.register_classes_factory(_CLASSES)
 
+# Scene property name -> the PropertyGroup it points at.
+_SCENE_PROPS = {
+    SCENE_PROP: PINBALL_PG_spline_export,
+    SIMPLIFY_SCENE_PROP: PINBALL_PG_simplify,
+}
+
 
 def register() -> None:
     _register_classes()
-    setattr(
-        bpy.types.Scene,
-        SCENE_PROP,
-        PointerProperty(type=PINBALL_PG_spline_export),
-    )
+    for name, group in _SCENE_PROPS.items():
+        setattr(bpy.types.Scene, name, PointerProperty(type=group))
 
 
 def unregister() -> None:
-    if hasattr(bpy.types.Scene, SCENE_PROP):
-        delattr(bpy.types.Scene, SCENE_PROP)
+    for name in _SCENE_PROPS:
+        if hasattr(bpy.types.Scene, name):
+            delattr(bpy.types.Scene, name)
     _unregister_classes()
 
 
@@ -434,8 +701,8 @@ if __name__ == "__main__":
     # Registering is otherwise completely silent, which makes success and failure
     # look identical -- especially with the sidebar collapsed, where a working
     # panel is invisible. Say so explicitly.
+    _panels = [c.bl_label for c in _CLASSES if issubclass(c, Panel)]
     print(
-        f"{PINBALL_PT_spline_export.bl_label!r} registered "
-        f"({len(_CLASSES)} classes). "
+        f"{_panels} registered ({len(_CLASSES)} classes). "
         f"3D Viewport -> N -> {PINBALL_PT_spline_export.bl_category!r} tab."
     )

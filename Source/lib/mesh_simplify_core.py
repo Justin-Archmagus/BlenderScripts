@@ -1,0 +1,376 @@
+"""
+mesh_simplify_core.py
+
+Shared logic for collapsing redundant profile columns out of a curve-converted
+mesh. No UI, no presentation -- same contract as spline_export_core.
+
+HOW TO RUN
+    Not runnable on its own; import it. See cli/simplify_mesh.py.
+
+WHAT IT DOES
+    A curve converted with a bevel produces a regular grid: W columns across the
+    profile, R rows along the length, and with Solidify two shells welded by a
+    rim. Most columns sit in the middle of a straight run of the profile and
+    carry no shape -- dissolving their lengthwise edge loops loses nothing.
+
+    Columns are classified by the angle the profile turns through at them. A
+    column whose incoming and outgoing directions are collinear within
+    angle_threshold is redundant. Boundary columns are always kept.
+
+    Measured on InnerRearRamp at width 11, that rule selects exactly columns
+    {0, 2, 8, 10} to keep -- the same set picked by hand. It generalises: at
+    width 5 it keeps {0, 1, 3, 4} without anyone re-deriving anything.
+
+WHY IT VERIFIES THE GRID FIRST
+    The column arithmetic is only valid on a genuine row-major grid. Dissolving
+    the wrong edges on an unexpected topology would quietly wreck the mesh, so
+    build_simplify_plan() reconciles vertex, edge and face counts against the
+    model and raises rather than guessing.
+
+STATUS
+    Written 2026-09-22 against measurements from InnerRearRamp, and executed
+    successfully the same day on that mesh: 2134 -> 804 verts, 2132 -> 788 faces,
+    1344 edges dissolved, via both the cli front-end and the panel. The angle
+    detector selected {0, 2, 8, 10}, matching the hand-picked set.
+"""
+
+import math
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import Enum, auto
+
+import bmesh
+import bpy
+from mathutils import Vector
+
+
+class SimplifyError(Exception):
+    """A precondition failed. The message is written for the person running it."""
+
+
+class WarningCode(Enum):
+    NOTHING_TO_DISSOLVE = auto()
+    KEEPS_EVERY_COLUMN = auto()
+    LOW_GRID_CONFIDENCE = auto()
+
+
+@dataclass(frozen=True)
+class SimplifyWarning:
+    code: WarningCode
+    message: str
+    blocking: bool = False
+
+
+@dataclass(frozen=True)
+class SimplifySettings:
+    """Front-end agnostic inputs.
+
+    Frozen for the same reason as ExportSettings: the plan carries the settings
+    it was built from, so the two cannot drift apart.
+    """
+
+    # Profile turn below this many degrees counts as collinear, so the column is
+    # redundant. 1.0 is deliberately tight -- a real corner in these ramps turns
+    # through tens of degrees.
+    angle_threshold_deg: float = 1.0
+
+    # Explicit 0-based columns to keep, overriding angle detection entirely.
+    # Empty means "detect". Use when the geometry disagrees with intent.
+    keep_columns_override: tuple[int, ...] = ()
+
+    # Refuse if the grid model explains less than this share of edges.
+    min_grid_confidence: float = 0.90
+
+
+@dataclass
+class GridModel:
+    """The structure recovered from the mesh, with its own evidence."""
+
+    width: int
+    rows: int
+    shells: int
+    verts: int
+    edges: int
+    confidence: float
+    shell_stride: int
+
+    def column_of(self, vertex_index: int) -> int:
+        """Column for a vertex index.
+
+        Valid across every shell only because shell_stride is a multiple of
+        width -- checked in build_simplify_plan, not assumed here.
+        """
+        return vertex_index % self.width
+
+
+@dataclass
+class SimplifyPlan:
+    source: bpy.types.Object
+    settings: SimplifySettings
+    grid: GridModel
+    keep_columns: tuple[int, ...]
+    dissolve_columns: tuple[int, ...]
+    column_angles_deg: tuple[float, ...]
+    edges_to_dissolve: int
+    predicted_verts: int
+    warnings: list[SimplifyWarning] = field(default_factory=list)
+
+    @property
+    def blocking_warnings(self) -> list[SimplifyWarning]:
+        return [w for w in self.warnings if w.blocking]
+
+
+@dataclass
+class SimplifyResult:
+    verts_before: int
+    verts_after: int
+    faces_before: int
+    faces_after: int
+    edges_dissolved: int
+
+
+# -------------------------------------------------------------------- helpers
+
+def _open_bmesh(obj: bpy.types.Object) -> tuple[bmesh.types.BMesh, bool]:
+    """A bmesh for the object, plus whether it is the live edit-mode one.
+
+    The caller must not free a live edit bmesh; Blender owns it.
+    """
+    if bpy.context.mode == 'EDIT_MESH':
+        return bmesh.from_edit_mesh(obj.data), True
+    bm = bmesh.new()
+    bm.from_mesh(obj.data)
+    return bm, False
+
+
+def recover_grid(bm: bmesh.types.BMesh, min_confidence: float) -> GridModel:
+    """Recover the grid from index deltas, and check it actually reconciles.
+
+    In a row-major grid every edge joins indices differing by 1 (across the
+    profile), by W (along the length), or by the shell stride (the Solidify rim).
+    The dominant non-1 delta is W.
+    """
+    bm.verts.index_update()
+    bm.edges.index_update()
+    vert_count, edge_count = len(bm.verts), len(bm.edges)
+    if edge_count == 0:
+        raise SimplifyError("Mesh has no edges.")
+
+    deltas = Counter(abs(e.verts[0].index - e.verts[1].index) for e in bm.edges)
+    non_unit = [d for d, _ in deltas.most_common() if d != 1]
+    if not non_unit:
+        raise SimplifyError("Only delta-1 edges; this is not a row-major grid.")
+
+    width = non_unit[0]
+    if width < 3:
+        raise SimplifyError(f"Recovered width {width} is too small to simplify.")
+
+    explained = deltas.get(1, 0) + deltas.get(width, 0)
+    confidence = explained / edge_count
+    if confidence < min_confidence:
+        raise SimplifyError(
+            f"Grid model explains only {confidence:.1%} of edges (need "
+            f"{min_confidence:.0%}). This mesh is not the regular grid the "
+            f"column arithmetic assumes; refusing rather than guessing."
+        )
+
+    # The next-largest delta is the shell stride if Solidify welded two shells.
+    stride = non_unit[1] if len(non_unit) > 1 else vert_count
+    shells = max(1, round(vert_count / stride)) if stride else 1
+    if shells > 1 and stride % width != 0:
+        raise SimplifyError(
+            f"Shell stride {stride} is not a multiple of width {width}, so a "
+            f"single column formula cannot address both shells."
+        )
+
+    rows = (vert_count // shells) // width
+    if rows * width * shells != vert_count:
+        raise SimplifyError(
+            f"{vert_count} verts is not {shells} shells x {rows} rows x "
+            f"{width} columns; the grid does not reconcile."
+        )
+
+    return GridModel(
+        width=width,
+        rows=rows,
+        shells=shells,
+        verts=vert_count,
+        edges=edge_count,
+        confidence=confidence,
+        shell_stride=stride,
+    )
+
+
+def profile_turn_angles(bm: bmesh.types.BMesh, grid: GridModel) -> tuple[float, ...]:
+    """Degrees the profile turns through at each column of one cross-section.
+
+    Boundary columns get 180.0 (treated as maximally significant) so they are
+    never dissolved. Row 0 of shell 0 is the reference cross-section.
+    """
+    verts = list(bm.verts)
+    section = [verts[i].co.copy() for i in range(grid.width)]
+
+    angles = []
+    for column in range(grid.width):
+        if column in (0, grid.width - 1):
+            angles.append(180.0)
+            continue
+        incoming: Vector = section[column] - section[column - 1]
+        outgoing: Vector = section[column + 1] - section[column]
+        if incoming.length == 0.0 or outgoing.length == 0.0:
+            angles.append(0.0)
+            continue
+        angles.append(math.degrees(incoming.angle(outgoing, 0.0)))
+    return tuple(angles)
+
+
+# ----------------------------------------------------------------- plan/apply
+
+def build_simplify_plan(
+    context: bpy.types.Context, settings: SimplifySettings
+) -> SimplifyPlan:
+    """Work out which columns to dissolve. Changes nothing."""
+    obj = context.active_object
+    if obj is None:
+        raise SimplifyError("No active object. Select the converted mesh.")
+    if obj.type != 'MESH':
+        raise SimplifyError(f"Active object {obj.name!r} is a {obj.type}, not a MESH.")
+
+    bm, is_live = _open_bmesh(obj)
+    try:
+        grid = recover_grid(bm, settings.min_grid_confidence)
+        angles = profile_turn_angles(bm, grid)
+
+        if settings.keep_columns_override:
+            keep = tuple(sorted(set(settings.keep_columns_override)))
+            out_of_range = [c for c in keep if not 0 <= c < grid.width]
+            if out_of_range:
+                raise SimplifyError(
+                    f"keep_columns_override {out_of_range} outside 0..{grid.width - 1}."
+                )
+        else:
+            keep = tuple(
+                c for c, angle in enumerate(angles)
+                if angle >= settings.angle_threshold_deg
+            )
+
+        dissolve = tuple(c for c in range(grid.width) if c not in keep)
+
+        # Lengthwise edges in the doomed columns, across every shell. Counted
+        # here so the dry run can report it without touching anything.
+        doomed = _lengthwise_edges(bm, grid, dissolve)
+
+        warnings: list[SimplifyWarning] = []
+        if not dissolve:
+            warnings.append(SimplifyWarning(
+                WarningCode.NOTHING_TO_DISSOLVE,
+                f"Every column turns through at least "
+                f"{settings.angle_threshold_deg} degrees, so none are redundant.",
+                blocking=True,
+            ))
+        if len(keep) == grid.width:
+            warnings.append(SimplifyWarning(
+                WarningCode.KEEPS_EVERY_COLUMN,
+                "Keep set covers the whole profile; nothing would change.",
+                blocking=True,
+            ))
+        if grid.confidence < 0.95:
+            warnings.append(SimplifyWarning(
+                WarningCode.LOW_GRID_CONFIDENCE,
+                f"Grid model explains {grid.confidence:.1%} of edges. Check the "
+                f"result; anything below ~95% means unexpected topology.",
+            ))
+
+        # The two end rows keep their full width. A vertex in a dissolved column
+        # normally drops to 2 edges once its lengthwise pair goes, so use_verts
+        # removes it -- but an end-row vertex also carries a rim edge (or, with
+        # no Solidify, sits on the open boundary), leaving it 3-valent and alive.
+        #
+        # Corrected 2026-09-22 against a live run: the old shells*rows*len(keep)
+        # form predicted 776 where the mesh came out at 804, short by exactly
+        # 7 dissolved columns x 2 end rows x 2 shells.
+        interior_rows = max(0, grid.rows - 2)
+        end_rows = min(2, grid.rows)
+        predicted = grid.shells * (
+            interior_rows * len(keep) + end_rows * grid.width
+        )
+        return SimplifyPlan(
+            source=obj,
+            settings=settings,
+            grid=grid,
+            keep_columns=keep,
+            dissolve_columns=dissolve,
+            column_angles_deg=angles,
+            edges_to_dissolve=len(doomed),
+            predicted_verts=predicted,
+            warnings=warnings,
+        )
+    finally:
+        if not is_live:
+            bm.free()
+
+
+def _lengthwise_edges(
+    bm: bmesh.types.BMesh, grid: GridModel, columns: tuple[int, ...]
+) -> list[bmesh.types.BMEdge]:
+    """Edges running along the length within the given columns.
+
+    Identified by an index delta of exactly the grid width, which in a row-major
+    grid is precisely the lengthwise direction.
+    """
+    wanted = set(columns)
+    found = []
+    for edge in bm.edges:
+        a, b = edge.verts[0].index, edge.verts[1].index
+        if abs(a - b) != grid.width:
+            continue
+        if grid.column_of(min(a, b)) in wanted:
+            found.append(edge)
+    return found
+
+
+def execute_simplify_plan(
+    context: bpy.types.Context, plan: SimplifyPlan
+) -> SimplifyResult:
+    """Apply the plan. The only mutating function in this module."""
+    if plan.blocking_warnings:
+        raise SimplifyError(
+            "; ".join(w.message for w in plan.blocking_warnings)
+        )
+
+    obj = plan.source
+    bm, is_live = _open_bmesh(obj)
+    try:
+        # Rebuilt rather than reusing the plan's bmesh: that one was opened for
+        # reading and, outside edit mode, has already been freed.
+        grid = recover_grid(bm, plan.settings.min_grid_confidence)
+        if grid.width != plan.grid.width:
+            raise SimplifyError(
+                f"Mesh changed since the plan was built (width {plan.grid.width} "
+                f"-> {grid.width}). Re-plan before executing."
+            )
+
+        verts_before, faces_before = len(bm.verts), len(bm.faces)
+        doomed = _lengthwise_edges(bm, grid, plan.dissolve_columns)
+
+        # One call, after collecting every edge: indices shift as soon as
+        # anything is removed, so a second pass would address the wrong geometry.
+        bmesh.ops.dissolve_edges(bm, edges=doomed, use_verts=True)
+
+        result = SimplifyResult(
+            verts_before=verts_before,
+            verts_after=len(bm.verts),
+            faces_before=faces_before,
+            faces_after=len(bm.faces),
+            edges_dissolved=len(doomed),
+        )
+
+        if is_live:
+            bmesh.update_edit_mesh(obj.data)
+        else:
+            bm.to_mesh(obj.data)
+            obj.data.update()
+        return result
+    finally:
+        if not is_live:
+            bm.free()

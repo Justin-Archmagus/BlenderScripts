@@ -28,10 +28,14 @@ STATUS
     Extracted from spline_to_unreal_mesh.py on 2026-09-22, then restructured to
     return data instead of formatted output.
 
-    Verified 2026-09-22: build_plan() and the conversion half of execute_plan()
-    both run correctly, tested via the script with write_fbx=False. The FBX write
-    path -- preset kwargs reaching bpy.ops.export_scene.fbx, the overwrite guard,
-    and whether Unreal accepts the result -- has still never been exercised.
+    Verified end to end 2026-09-22. build_plan() and execute_plan() both run
+    correctly including the FBX write path: the parsed "Unreal - mesh" preset
+    kwargs reach bpy.ops.export_scene.fbx, a file is produced, and Unreal imports
+    it looking correct. Exercised from both the cli front-end and the panel.
+
+    So the axis and scale settings carried in that preset -- axis_forward='-Z',
+    axis_up='Y', bake_space_transform=True -- are confirmed against the real
+    importer, not just against the docs.
 """
 
 import ast
