@@ -2,7 +2,8 @@
 spline_to_unreal_mesh.py
 
 Script front-end for spline_export_core. Converts the active curve into a mesh,
-optionally simplifies it (SIMPLIFY), centres it on the world origin, parks it in
+optionally simplifies it (SIMPLIFY), optionally lays out its UVs (UV_LAYOUT),
+centres it on the world origin, parks it in
 the Export collection, and optionally writes an FBX using the "Unreal - mesh"
 operator preset.
 
@@ -76,6 +77,11 @@ ORIGIN_CENTER = 'MEDIAN'
 # using mesh_simplify_core's default SimplifySettings. Best-effort: if the mesh
 # cannot be simplified, the export goes ahead unsimplified with a warning.
 SIMPLIFY = False
+
+# Lay out straight UV islands and mark seams after Simplify, using
+# mesh_uv_core's default UVSettings. NOT best-effort: if the layout is not
+# possible the plan is blocked, since the shader needs it.
+UV_LAYOUT = False
 
 REPORT_TEXT_NAME = "spline_export_report.txt"
 
@@ -174,6 +180,22 @@ def format_report(plan: ExportPlan, dry_run: bool) -> str:
             f"{plan.verts} -> {analysis.predicted_verts} verts (predicted)",
         ]
 
+    uv = plan.uv_layout
+    if settings.uv_layout is None:
+        lines.append("  -> uv layout     : off")
+    elif uv is None:
+        lines.append("  -> uv layout     : NOT POSSIBLE (reason under warnings)")
+    else:
+        lines.append(
+            f"  -> uv layout     : grid {uv.grid.width} x {uv.grid.rows} x "
+            f"{uv.grid.shells}, inner shell {uv.inner_shell}, "
+            f"{uv.seams_to_mark} seams")
+        for island in uv.islands:
+            lines.append(
+                f"                     {island.name:<6} {island.faces} faces, "
+                f"U {'reversed' if island.u_reversed else 'forward'}, "
+                f"{island.mirrored_faces} mirrored")
+
     if settings.write_fbx:
         kwargs = plan.preset_kwargs
         lines += [
@@ -211,12 +233,16 @@ def format_report(plan: ExportPlan, dry_run: bool) -> str:
 
 def format_result(plan: ExportPlan, result: ExportResult) -> str:
     simplified = result.simplify
+    uv = result.uv_layout
     return "\n".join([
         f"  converted  : {result.mesh_object_name!r} "
         f"({result.verts} verts, {result.polys} polys)",
         f"  simplified : {simplified.verts_before} -> {simplified.verts_after} verts, "
         f"{simplified.edges_dissolved} edges dissolved"
         if simplified is not None else "  simplified : no",
+        f"  uv layout  : {uv.faces_written} faces -> {uv.uv_layer}"
+        f"{' (created)' if uv.uv_layer_created else ''}, {uv.seams_marked} seams"
+        if uv is not None else "  uv layout  : no",
         f"  exported   : {result.fbx_path or 'skipped (WRITE_FBX is False)'}",
         f"  source     : {plan.source.name!r} untouched",
         "=======================================================================",
@@ -251,6 +277,7 @@ def _run(core: ModuleType, sections: list[str]) -> None:
         # From the export core's own simplify_core, so the class is the one the
         # export will use.
         simplify=core.simplify_core.SimplifySettings() if SIMPLIFY else None,
+        uv_layout=core.uv_core.UVSettings() if UV_LAYOUT else None,
         write_fbx=WRITE_FBX,
         allow_overwrite=ALLOW_OVERWRITE,
     )

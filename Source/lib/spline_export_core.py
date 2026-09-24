@@ -47,6 +47,14 @@ STATUS
     refused, Blender-relative export folders resolved, name override sanitized,
     name clashes warned, operator results checked, and execute_plan() rolls back
     its partial mesh (and any file it newly created) on failure.
+
+    Added and tested in Blender 2026-09-24: optional UV layout step via
+    mesh_uv_core. ExportSettings.uv_layout carries UVSettings or None.
+    build_plan() predicts the layout on an in-memory copy of the evaluated mesh,
+    simplified first when simplify will run, so the plan describes the mesh the
+    UVs land on. Unlike simplify this is NOT best-effort: a layout that cannot
+    be done blocks the export, since a mesh without it is unusable by the
+    shader it is for.
 """
 
 import ast
@@ -59,18 +67,22 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal, get_args
 
+import bmesh
 import bpy
 
-# The export can simplify its converted mesh, so this core depends on the
-# simplify core -- a sibling in Source/lib, already on sys.path by the time any
-# front-end imports this module. Reloaded here because front-ends reload only
-# the module they import: without it, an edit to mesh_simplify_core would stay
+# The export can simplify its converted mesh and lay out its UVs, so this core
+# depends on both cores -- siblings in Source/lib, already on sys.path by the
+# time any front-end imports this module. Reloaded here because front-ends
+# reload only the module they import: without it, an edit to either would stay
 # invisible to the export until Blender restarts, the exact trap the front-end
 # bootstraps exist to avoid. reload() re-executes in place, so a front-end that
-# also holds this module sees the same, current, object.
+# also holds these modules sees the same, current, objects. (uv_core reloads
+# simplify_core again itself; harmless.)
 import mesh_simplify_core as simplify_core
+import mesh_uv_core as uv_core
 
 importlib.reload(simplify_core)
+importlib.reload(uv_core)
 
 PRESET_SUBDIR = "operator/export_scene.fbx"
 PRESET_FILE = "Unreal_-_mesh.py"
@@ -109,6 +121,8 @@ class WarningCode(Enum):
     NAME_TAKEN = auto()
     SIMPLIFY_SKIPPED = auto()
     SIMPLIFY_NOTE = auto()
+    UV_FAILED = auto()
+    UV_NOTE = auto()
 
 
 @dataclass(frozen=True)
@@ -138,6 +152,8 @@ class ExportSettings:
     # None skips simplification. Settings rather than a bool, so on/off and the
     # parameters travel as one value and cannot disagree.
     simplify: simplify_core.SimplifySettings | None = None
+    # None skips the UV layout. Same one-value shape as simplify.
+    uv_layout: uv_core.UVSettings | None = None
     write_fbx: bool = True
     allow_overwrite: bool = False
 
@@ -169,6 +185,9 @@ class ExportPlan:
     # What simplifying will do, analysed on the evaluated mesh. None when
     # simplify is off, or on but not possible -- the latter with a warning.
     simplify: simplify_core.SimplifyAnalysis | None = None
+    # The UV layout, predicted on the evaluated mesh after the planned simplify.
+    # None when off, or on but impossible -- the latter with a blocking warning.
+    uv_layout: uv_core.UVAnalysis | None = None
     stale_preset_path: str | None = None
     unparsed_preset_lines: list[str] = field(default_factory=list)
     warnings: list[PlanWarning] = field(default_factory=list)
@@ -188,6 +207,23 @@ class ExportResult:
     polys: int
     fbx_path: Path | None = None
     simplify: simplify_core.SimplifyResult | None = None
+    uv_layout: uv_core.UVResult | None = None
+
+
+@dataclass
+class SourceEvaluation:
+    """What evaluating the source curve found, from one to_mesh() pass.
+
+    Each optional step carries either its analysis or the reason it cannot run,
+    never both.
+    """
+
+    verts: int
+    polys: int
+    simplify: simplify_core.SimplifyAnalysis | None = None
+    simplify_skipped: str | None = None
+    uv_layout: uv_core.UVAnalysis | None = None
+    uv_failed: str | None = None
 
 
 # -------------------------------------------------------------------- helpers
@@ -252,15 +288,19 @@ def load_preset_kwargs(
 
 
 def evaluate_source(
-    obj: bpy.types.Object, simplify: simplify_core.SimplifySettings | None
-) -> tuple[int, int, simplify_core.SimplifyAnalysis | None, str | None]:
+    obj: bpy.types.Object,
+    simplify: simplify_core.SimplifySettings | None,
+    uv_layout: uv_core.UVSettings | None,
+) -> SourceEvaluation:
     """What the conversion would produce, without converting.
 
-    Returns vertex and polygon counts, plus -- when simplify settings are given
-    -- the simplify analysis of that same geometry, or the reason it is not
-    possible. One evaluation serves both, since the temporary mesh is the
-    expensive part. The analysis holds plain values only, so it survives the
-    to_mesh_clear() below.
+    Vertex and polygon counts, plus the analysis -- or the reason there is none
+    -- for each optional step that has settings. One evaluation serves them all,
+    since the temporary mesh is the expensive part. The analyses hold plain
+    values only, so they survive the to_mesh_clear() below.
+
+    The simplify go/no-go is decided here, not in build_plan(), because the UV
+    prediction has to know whether it is looking at a simplified mesh.
 
     Uses the evaluated depsgraph so modifiers (Solidify here) are included. This
     is the expensive call that keeps build_plan() out of Panel.draw().
@@ -273,15 +313,49 @@ def evaluate_source(
         # which yields a mesh (possibly empty), so this is a guard, not a path.
         if mesh is None:
             raise PlanError(f"{obj.name!r} produced no geometry when evaluated.")
-        verts, polys = len(mesh.vertices), len(mesh.polygons)
-        if simplify is None:
-            return verts, polys, None, None
-        try:
-            return verts, polys, simplify_core.analyze_mesh(mesh, simplify), None
-        except simplify_core.SimplifyError as exc:
-            return verts, polys, None, str(exc)
+        found = SourceEvaluation(verts=len(mesh.vertices), polys=len(mesh.polygons))
+
+        if simplify is not None:
+            try:
+                analysis = simplify_core.analyze_mesh(mesh, simplify)
+            except simplify_core.SimplifyError as exc:
+                found.simplify_skipped = str(exc)
+            else:
+                if analysis.blocking_warnings:
+                    found.simplify_skipped = "; ".join(
+                        w.message for w in analysis.blocking_warnings)
+                else:
+                    found.simplify = analysis
+
+        if uv_layout is not None:
+            found.uv_layout, found.uv_failed = _predict_uv_layout(
+                mesh, found.simplify, uv_layout)
+        return found
     finally:
         evaluated.to_mesh_clear()
+
+
+def _predict_uv_layout(
+    mesh: bpy.types.Mesh,
+    simplify: simplify_core.SimplifyAnalysis | None,
+    settings: uv_core.UVSettings,
+) -> tuple[uv_core.UVAnalysis | None, str | None]:
+    """The UV layout of the mesh execution will produce, or why there is none.
+
+    Simplifies an in-memory copy first when simplify will run: the layout runs
+    after simplify, so its grid is the simplified one, and execution's re-check
+    compares against that.
+    """
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        if simplify is not None:
+            simplify_core.simplify_bmesh(bm, simplify)
+        return uv_core.analyze_bmesh(bm, settings), None
+    except (simplify_core.SimplifyError, uv_core.UVError) as exc:
+        return None, str(exc)
+    finally:
+        bm.free()
 
 
 def _require(result: AbstractSet[str], action: str) -> None:
@@ -527,24 +601,39 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
     out_path: Path | None = (
         export_dir / f"{mesh_name}.fbx" if export_dir is not None else None
     )
-    verts, polys, analysis, skip_reason = evaluate_source(source, settings.simplify)
+    found = evaluate_source(source, settings.simplify, settings.uv_layout)
+    verts, polys = found.verts, found.polys
     units = context.scene.unit_settings
 
     # Simplify is best-effort inside an export: when it cannot help, the export
     # still goes ahead unsimplified, and says why. None of these warnings block.
     if settings.simplify is not None:
-        if analysis is not None and analysis.blocking_warnings:
-            skip_reason = "; ".join(w.message for w in analysis.blocking_warnings)
-            analysis = None
-        if analysis is None:
+        if found.simplify is None:
             warnings.append(PlanWarning(
                 WarningCode.SIMPLIFY_SKIPPED,
-                f"Simplify skipped, exporting unsimplified: {skip_reason}",
+                f"Simplify skipped, exporting unsimplified: {found.simplify_skipped}",
             ))
         else:
-            for note in analysis.warnings:
+            for note in found.simplify.warnings:
                 warnings.append(PlanWarning(
                     WarningCode.SIMPLIFY_NOTE, f"Simplify: {note.message}"
+                ))
+
+    # The UV layout is NOT best-effort. The shader depends on it, so exporting
+    # without it would ship a mesh that only looks wrong once it is in Unreal.
+    if settings.uv_layout is not None:
+        if found.uv_layout is None:
+            warnings.append(PlanWarning(
+                WarningCode.UV_FAILED,
+                f"UV layout not possible: {found.uv_failed} Untick UV Layout to "
+                f"export without it.",
+                blocking=True,
+            ))
+        else:
+            for note in found.uv_layout.warnings:
+                warnings.append(PlanWarning(
+                    WarningCode.UV_NOTE, f"UV layout: {note.message}",
+                    blocking=note.blocking,
                 ))
 
     if polys == 0:
@@ -586,7 +675,8 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
         unit_scale=units.scale_length,
         unit_system=units.system,
         target_exists=target_exists,
-        simplify=analysis,
+        simplify=found.simplify,
+        uv_layout=found.uv_layout,
         stale_preset_path=stale_path,
         unparsed_preset_lines=unparsed,
         warnings=warnings,
@@ -675,6 +765,17 @@ def execute_plan(context: bpy.types.Context, plan: ExportPlan) -> ExportResult:
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True),
             "Apply rotation and scale",
         )
+
+        # UVs after the transform is applied, so their proportions come from
+        # world-space distances; under a non-uniform object scale the local-space
+        # ones would be wrong. The plan measured local space, but layout_mesh()'s
+        # re-check compares only topology (grid, inner shell, island face
+        # counts), which the transform cannot change. Before origin_set, which
+        # only translates. A mismatch raises into the rollback below.
+        laid_out: uv_core.UVResult | None = None
+        if plan.uv_layout is not None:
+            laid_out = uv_core.layout_mesh(mesh, plan.uv_layout)
+
         _require(
             bpy.ops.object.origin_set(
                 type='ORIGIN_GEOMETRY', center=settings.origin_center
@@ -718,4 +819,5 @@ def execute_plan(context: bpy.types.Context, plan: ExportPlan) -> ExportResult:
         polys=len(mesh.polygons),
         fbx_path=written,
         simplify=simplified,
+        uv_layout=laid_out,
     )

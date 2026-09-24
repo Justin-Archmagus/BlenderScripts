@@ -532,6 +532,16 @@ def execute_simplify_plan(
             bm.free()
 
 
+def simplify_bmesh(bm: bmesh.types.BMesh, expected: SimplifyAnalysis) -> SimplifyResult:
+    """Apply an analysis to a caller-owned bmesh. Mutates bm only.
+
+    For predicting what follows a simplify without touching any mesh -- the
+    export plans its UV layout on a simplified in-memory copy of the evaluated
+    mesh. Same checks as the other mutating paths.
+    """
+    return _apply(bm, expected)
+
+
 def simplify_mesh(mesh: bpy.types.Mesh, expected: SimplifyAnalysis) -> SimplifyResult:
     """Apply an analysis to a mesh outside Edit Mode. Mutates the mesh.
 

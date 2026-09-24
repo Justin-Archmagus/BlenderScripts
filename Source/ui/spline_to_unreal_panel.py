@@ -41,6 +41,10 @@ STATUS
     Registered and exercised 2026-09-22. Both panels appear in the Pinball tab,
     and both operator pairs have been run: Preview -> Convert & Export, and
     Analyze -> Simplify.
+
+    UV Layout panel (Analyze -> Lay Out UVs, over mesh_uv_core) added and
+    tested 2026-09-24. Its UV Layout checkbox on the Spline to Unreal panel,
+    sharing the same settings, added and tested the same day.
 """
 
 from pathlib import Path
@@ -72,6 +76,7 @@ if TYPE_CHECKING:
     # so every use of it must stay in a quoted annotation.
     from bpy.stub_internal.rna_enums import OperatorReturnItems
     from mesh_simplify_core import SimplifyPlan, SimplifySettings
+    from mesh_uv_core import UVPlan, UVSettings
     from spline_export_core import ExportPlan, ExportSettings
 
 # The core lives in Source/lib, a sibling of this file's folder (Source/ui).
@@ -85,9 +90,11 @@ CORE_DIR_FALLBACK = r"D:\dev\Blender\Scripts\BlenderScripts\Source\lib"
 
 EXPORT_MODULE = "spline_export_core"
 SIMPLIFY_MODULE = "mesh_simplify_core"
+UV_MODULE = "mesh_uv_core"
 
 SCENE_PROP = "pinball_spline_export"
 SIMPLIFY_SCENE_PROP = "pinball_simplify"
+UV_SCENE_PROP = "pinball_uv_layout"
 
 _modules: dict[str, ModuleType] = {}
 
@@ -151,6 +158,10 @@ def _get_core() -> ModuleType:
 
 def _get_simplify() -> ModuleType:
     return _get_module(SIMPLIFY_MODULE)
+
+
+def _get_uv() -> ModuleType:
+    return _get_module(UV_MODULE)
 
 
 def _active_of_type(context: Context, type_name: str) -> Object | None:
@@ -245,6 +256,13 @@ class PINBALL_PG_spline_export(PropertyGroup):
         description="Reduce geometry of converted mesh if possible",
         default=True,
     )
+    # Switch only, like simplify: the parameters are the UV Layout panel's.
+    uv_layout: BoolProperty(
+        name="UV Layout",
+        description="Lay out straight UV islands and mark seams on the converted "
+                    "mesh, after Simplify. Blocks the export if not possible",
+        default=True,
+    )
     write_fbx: BoolProperty(
         name="Write FBX",
         description="Off converts the mesh but touches no files",
@@ -266,6 +284,8 @@ class PINBALL_PG_spline_export(PropertyGroup):
     # One display line; empty when simplify is off or will be skipped (the skip
     # reason is among the warnings).
     preview_simplify: StringProperty()
+    # Same, for the UV layout; empty when off or impossible (see warnings).
+    preview_uv_layout: StringProperty()
     preview_blocked: BoolProperty(default=False)
     preview_warnings: CollectionProperty(type=PINBALL_PG_warning)
 
@@ -278,12 +298,14 @@ def _settings_from(
     core: ModuleType,
     props: PINBALL_PG_spline_export,
     simplify_props: "PINBALL_PG_simplify",
+    uv_props: "PINBALL_PG_uv_layout",
 ) -> "ExportSettings":
-    # The export core exposes the simplify core it depends on, so the settings
-    # class comes from the same module object the export will use.
+    # The export core exposes the cores it depends on, so the settings classes
+    # come from the same module objects the export will use.
     simplify = (
         _simplify_settings(core.simplify_core, simplify_props) if props.simplify else None
     )
+    uv_layout = _uv_settings(core.uv_core, uv_props) if props.uv_layout else None
     return core.ExportSettings(
         export_dir=props.export_dir,
         # Core is name-based, so the pointer is resolved here. Read fresh each
@@ -294,6 +316,7 @@ def _settings_from(
         name_override=props.name_override,
         origin_center=props.origin_center,
         simplify=simplify,
+        uv_layout=uv_layout,
         write_fbx=props.write_fbx,
         allow_overwrite=props.allow_overwrite,
     )
@@ -316,6 +339,12 @@ def _store_preview(props: PINBALL_PG_spline_export, plan: "ExportPlan") -> None:
         f"Simplify: keep {list(analysis.keep_columns)}, "
         f"{plan.verts} -> {analysis.predicted_verts} verts"
         if analysis is not None else ""
+    )
+    uv = plan.uv_layout
+    props.preview_uv_layout = (
+        f"UV layout: {len(uv.islands)} islands, {uv.seams_to_mark} seams, "
+        f"{sum(i.mirrored_faces for i in uv.islands)} mirrored"
+        if uv is not None else ""
     )
     props.preview_blocked = bool(plan.blocking_warnings)
     props.preview_valid = True
@@ -348,7 +377,8 @@ class PINBALL_OT_spline_preview(Operator):
         props = _props(context)
         try:
             core = _get_core()
-            settings = _settings_from(core, props, _simplify_props(context))
+            settings = _settings_from(
+                core, props, _simplify_props(context), _uv_props(context))
             plan = core.build_plan(context, settings)
         except Exception as exc:
             # Broad on purpose, as in the simplify operators: a PlanError, a failed
@@ -390,7 +420,8 @@ class PINBALL_OT_spline_export(Operator):
             core = _get_core()
             # Rebuilt rather than reused: the cache is a display projection, and
             # the scene may have changed since Preview ran.
-            settings = _settings_from(core, props, _simplify_props(context))
+            settings = _settings_from(
+                core, props, _simplify_props(context), _uv_props(context))
             plan = core.build_plan(context, settings)
             result = core.execute_plan(context, plan)
         except Exception as exc:
@@ -408,9 +439,13 @@ class PINBALL_OT_spline_export(Operator):
             f"{result.simplify.verts_after} verts)"
             if result.simplify is not None else ""
         )
+        laid_out = (
+            f", UVs laid out ({result.uv_layout.seams_marked} seams)"
+            if result.uv_layout is not None else ""
+        )
         self.report(
             {'INFO'},
-            f"{result.mesh_object_name}: {result.polys} polys{simplified} "
+            f"{result.mesh_object_name}: {result.polys} polys{simplified}{laid_out} "
             f"-> {destination}",
         )
         return {'FINISHED'}
@@ -460,6 +495,12 @@ class PINBALL_PT_spline_export(Panel):
         _draw_simplify_settings(sub, _simplify_props(context))
         sub.label(text="Shared with the Simplify panel", icon='LINKED')
         col = layout.column()
+        col.prop(props, "uv_layout")
+        sub = col.column()
+        sub.enabled = props.uv_layout
+        _draw_uv_settings(sub, _uv_props(context))
+        sub.label(text="Shared with the UV Layout panel", icon='LINKED')
+        col = layout.column()
         col.prop(props, "write_fbx")
         sub = col.column()
         sub.enabled = props.write_fbx
@@ -481,6 +522,8 @@ class PINBALL_PT_spline_export(Panel):
                 )
                 if props.preview_simplify:
                     box.label(text=props.preview_simplify, icon='MOD_DECIM')
+                if props.preview_uv_layout:
+                    box.label(text=props.preview_uv_layout, icon='UV')
                 if props.preview_out_path:
                     box.label(text=Path(props.preview_out_path).name, icon='EXPORT')
                 for warning in props.preview_warnings:
@@ -738,6 +781,226 @@ class PINBALL_PT_simplify(Panel):
         layout.operator(PINBALL_OT_simplify_apply.bl_idname, icon='MOD_DECIM')
 
 
+# ------------------------------------------------------------------- uv state
+
+class PINBALL_PG_uv_layout(PropertyGroup):
+    """UV layout inputs plus a cached projection of the last analysis.
+
+    Same discipline as the other groups: plain values only, never the UVPlan,
+    which holds a live object reference.
+    """
+
+    fill_height: FloatProperty(
+        name="Fill Height",
+        description="Share of the UV height each island fills, centred. Each "
+                    "island is scaled uniformly, so density differs between "
+                    "islands but never within one",
+        default=0.95, min=0.05, max=1.0, subtype='FACTOR',
+    )
+    margin: FloatProperty(
+        name="Margin",
+        description="UV-space gap left and right of, and between, islands",
+        default=0.01, min=0.0, max=0.099, precision=3,
+    )
+    min_grid_confidence: FloatProperty(
+        name="Min Grid Confidence",
+        description="Refuse if the row-major grid model explains less than this "
+                    "share of the mesh's edges",
+        default=0.90, min=0.0, max=1.0,
+    )
+
+    # --- cached analysis, for display only
+    preview_valid: BoolProperty(default=False)
+    preview_source: StringProperty()
+    preview_grid: StringProperty()
+    # One display line per island, newline-joined. A CollectionProperty would
+    # need its own PropertyGroup for what is only ever drawn as text.
+    preview_islands: StringProperty()
+    preview_width_fit: FloatProperty()
+    preview_seams: StringProperty()
+    preview_blocked: BoolProperty(default=False)
+    preview_warnings: CollectionProperty(type=PINBALL_PG_warning)
+
+
+def _uv_props(context: Context) -> PINBALL_PG_uv_layout:
+    return getattr(context.scene, UV_SCENE_PROP)
+
+
+def _draw_uv_settings(layout: UILayout, props: PINBALL_PG_uv_layout) -> None:
+    """The UV layout parameters, drawn identically by both panels."""
+    layout.prop(props, "fill_height")
+    layout.prop(props, "margin")
+    layout.prop(props, "min_grid_confidence")
+
+
+def _uv_settings(core: ModuleType, props: PINBALL_PG_uv_layout) -> "UVSettings":
+    return core.UVSettings(
+        min_grid_confidence=props.min_grid_confidence,
+        margin=props.margin,
+        fill_height=props.fill_height,
+    )
+
+
+def _store_uv_preview(props: PINBALL_PG_uv_layout, plan: "UVPlan") -> None:
+    props.preview_warnings.clear()
+    for warning in plan.warnings:
+        item = props.preview_warnings.add()
+        item.message = warning.message
+        item.blocking = warning.blocking
+
+    grid = plan.grid
+    props.preview_source = plan.source.name
+    props.preview_grid = (
+        f"{grid.width} wide x {grid.rows} long x {grid.shells} shells, "
+        f"{grid.confidence:.1%}"
+    )
+    props.preview_islands = "\n".join(
+        f"{i.name}: {i.faces} faces, U {'reversed' if i.u_reversed else 'forward'}, "
+        f"{i.mirrored_faces} mirrored"
+        for i in plan.islands
+    )
+    props.preview_width_fit = plan.width_fit
+    props.preview_seams = (
+        f"{plan.seams_to_mark} seams (replacing {plan.seams_existing}), "
+        f"layer {plan.uv_layer or 'UVMap (new)'}"
+    )
+    props.preview_blocked = bool(plan.blocking_warnings)
+    props.preview_valid = True
+
+
+def _uv_is_stale(context: Context, props: PINBALL_PG_uv_layout) -> bool:
+    obj = context.active_object
+    return props.preview_source != (obj.name if obj is not None else "")
+
+
+# --------------------------------------------------------------- uv operators
+
+class PINBALL_OT_uv_preview(Operator):
+    bl_idname = "pinball.uv_preview"
+    bl_label = "Analyze"
+    bl_description = "Recover the grid and report the UV islands and seams it would lay out"
+    # No UNDO: writes only the analysis cache.
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
+        return _active_mesh(context) is not None
+
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
+        props = _uv_props(context)
+        try:
+            core = _get_uv()
+            plan = core.build_uv_plan(context, _uv_settings(core, props))
+        except Exception as exc:
+            # Broad on purpose, as in the other operators: a UVError, a
+            # SimplifyError from grid recovery, or a failed module load all
+            # belong in the status bar.
+            props.preview_valid = False
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        _store_uv_preview(props, plan)
+        mirrored = sum(i.mirrored_faces for i in plan.islands)
+        self.report(
+            {'INFO'},
+            f"{len(plan.islands)} islands, {plan.seams_to_mark} seams, "
+            f"{mirrored} mirrored faces",
+        )
+        return {'FINISHED'}
+
+
+class PINBALL_OT_uv_apply(Operator):
+    bl_idname = "pinball.uv_apply"
+    bl_label = "Lay Out UVs"
+    bl_description = ("Write straight UV islands and mark seams. Edits the mesh in "
+                      "place, replacing its UVs and every seam")
+    # In place, like Simplify: Ctrl+Z is the way back.
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context: Context | None) -> bool:
+        assert context is not None
+        props = _uv_props(context)
+        return (
+            _active_mesh(context) is not None
+            and props.preview_valid
+            and not props.preview_blocked
+            and not _uv_is_stale(context, props)
+        )
+
+    def execute(self, context: Context | None) -> "set[OperatorReturnItems]":
+        assert context is not None
+        props = _uv_props(context)
+        try:
+            core = _get_uv()
+            # Rebuilt rather than reused: the cache is a display projection.
+            plan = core.build_uv_plan(context, _uv_settings(core, props))
+            result = core.execute_uv_plan(context, plan)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        props.preview_valid = False
+        created = " (created)" if result.uv_layer_created else ""
+        self.report(
+            {'INFO'},
+            f"{result.faces_written} faces -> {result.uv_layer}{created}, "
+            f"{result.seams_marked} seams marked, {result.seams_cleared} cleared",
+        )
+        return {'FINISHED'}
+
+
+class PINBALL_PT_uv_layout(Panel):
+    bl_label = "UV Layout"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Pinball"
+
+    def draw(self, context: Context | None) -> None:
+        assert context is not None
+        # Cheap reads only. build_uv_plan() walks every face and must never be
+        # called from here.
+        layout = self.layout
+        assert layout is not None  # See PINBALL_PT_spline_export.draw.
+        props = _uv_props(context)
+        mesh = _active_mesh(context)
+
+        header = layout.box()
+        if mesh is None:
+            header.label(text="Select a converted mesh", icon='ERROR')
+        else:
+            header.label(text=mesh.name, icon='OUTLINER_OB_MESH')
+
+        _draw_uv_settings(layout.column(), props)
+
+        layout.separator()
+        layout.operator(PINBALL_OT_uv_preview.bl_idname, icon='VIEWZOOM')
+
+        if props.preview_valid:
+            if _uv_is_stale(context, props):
+                layout.label(text="Selection changed, analyze again",
+                             icon='FILE_REFRESH')
+            else:
+                box = layout.box()
+                box.label(text=props.preview_grid, icon='MESH_GRID')
+                for line in props.preview_islands.splitlines():
+                    box.label(text=line, icon='UV')
+                if props.preview_width_fit < 1.0:
+                    box.label(text=f"U compressed to {props.preview_width_fit:.1%} "
+                                   f"to fit side by side", icon='ERROR')
+                box.label(text=props.preview_seams, icon='EDGESEL')
+                for warning in props.preview_warnings:
+                    box.label(
+                        text=warning.message,
+                        icon='CANCEL' if warning.blocking else 'ERROR',
+                    )
+
+        # poll() greys this out on its own.
+        layout.operator(PINBALL_OT_uv_apply.bl_idname, icon='UV_DATA')
+
+
 # --------------------------------------------------------------- registration
 
 # Order matters: PINBALL_PG_warning must register before either group whose
@@ -746,12 +1009,16 @@ _CLASSES = (
     PINBALL_PG_warning,
     PINBALL_PG_spline_export,
     PINBALL_PG_simplify,
+    PINBALL_PG_uv_layout,
     PINBALL_OT_spline_preview,
     PINBALL_OT_spline_export,
     PINBALL_OT_simplify_preview,
     PINBALL_OT_simplify_apply,
+    PINBALL_OT_uv_preview,
+    PINBALL_OT_uv_apply,
     PINBALL_PT_spline_export,
     PINBALL_PT_simplify,
+    PINBALL_PT_uv_layout,
 )
 
 _register_classes, _unregister_classes = bpy.utils.register_classes_factory(_CLASSES)
@@ -760,6 +1027,7 @@ _register_classes, _unregister_classes = bpy.utils.register_classes_factory(_CLA
 _SCENE_PROPS = {
     SCENE_PROP: PINBALL_PG_spline_export,
     SIMPLIFY_SCENE_PROP: PINBALL_PG_simplify,
+    UV_SCENE_PROP: PINBALL_PG_uv_layout,
 }
 
 
