@@ -2,8 +2,9 @@
 spline_to_unreal_mesh.py
 
 Script front-end for spline_export_core. Converts the active curve into a mesh,
-centres it on the world origin, parks it in the Export collection, and optionally
-writes an FBX using the "Unreal - mesh" operator preset.
+optionally simplifies it (SIMPLIFY), centres it on the world origin, parks it in
+the Export collection, and optionally writes an FBX using the "Unreal - mesh"
+operator preset.
 
 All logic lives in spline_export_core. This file owns configuration and the text
 report -- which is presentation, and deliberately does not live in the core, since
@@ -70,6 +71,11 @@ EXPORT_NAME_OVERRIDE = ""
 # 'MEDIAN' matches Blender's own "Origin to Geometry" default. 'BOUNDS' uses the
 # bounding-box centre, which reads as more centred for long asymmetric ramps.
 ORIGIN_CENTER = 'MEDIAN'
+
+# Dissolve redundant profile columns from the converted mesh before export,
+# using mesh_simplify_core's default SimplifySettings. Best-effort: if the mesh
+# cannot be simplified, the export goes ahead unsimplified with a warning.
+SIMPLIFY = False
 
 REPORT_TEXT_NAME = "spline_export_report.txt"
 
@@ -155,6 +161,19 @@ def format_report(plan: ExportPlan, dry_run: bool) -> str:
         f"  -> origin        : ORIGIN_GEOMETRY / {settings.origin_center}, then zeroed",
     ]
 
+    analysis = plan.simplify
+    if settings.simplify is None:
+        lines.append("  -> simplify      : off")
+    elif analysis is None:
+        lines.append("  -> simplify      : SKIPPED (reason under warnings)")
+    else:
+        lines += [
+            f"  -> simplify      : width {analysis.grid.width}, keep "
+            f"{list(analysis.keep_columns)}, dissolve {list(analysis.dissolve_columns)}",
+            f"                     {analysis.edges_to_dissolve} edges, "
+            f"{plan.verts} -> {analysis.predicted_verts} verts (predicted)",
+        ]
+
     if settings.write_fbx:
         kwargs = plan.preset_kwargs
         lines += [
@@ -191,9 +210,13 @@ def format_report(plan: ExportPlan, dry_run: bool) -> str:
 
 
 def format_result(plan: ExportPlan, result: ExportResult) -> str:
+    simplified = result.simplify
     return "\n".join([
         f"  converted  : {result.mesh_object_name!r} "
         f"({result.verts} verts, {result.polys} polys)",
+        f"  simplified : {simplified.verts_before} -> {simplified.verts_after} verts, "
+        f"{simplified.edges_dissolved} edges dissolved"
+        if simplified is not None else "  simplified : no",
         f"  exported   : {result.fbx_path or 'skipped (WRITE_FBX is False)'}",
         f"  source     : {plan.source.name!r} untouched",
         "=======================================================================",
@@ -225,6 +248,9 @@ def _run(core: ModuleType, sections: list[str]) -> None:
         export_collection=EXPORT_COLLECTION,
         name_override=EXPORT_NAME_OVERRIDE,
         origin_center=ORIGIN_CENTER,
+        # From the export core's own simplify_core, so the class is the one the
+        # export will use.
+        simplify=core.simplify_core.SimplifySettings() if SIMPLIFY else None,
         write_fbx=WRITE_FBX,
         allow_overwrite=ALLOW_OVERWRITE,
     )

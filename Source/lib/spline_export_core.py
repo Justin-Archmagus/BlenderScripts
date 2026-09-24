@@ -37,6 +37,12 @@ STATUS
     axis_up='Y', bake_space_transform=True -- are confirmed against the real
     importer, not just against the docs.
 
+    Added and tested in Blender 2026-09-23: optional simplify step. ExportSettings.simplify
+    carries SimplifySettings or None; build_plan() analyses the evaluated mesh
+    and execute_plan() simplifies the converted duplicate before the transform
+    and origin steps. Best-effort: when simplify cannot help, the export
+    proceeds unsimplified with a warning.
+
     Hardened and tested in Blender 2026-09-23: excluded/hidden/locked export collections
     refused, Blender-relative export folders resolved, name override sanitized,
     name clashes warned, operator results checked, and execute_plan() rolls back
@@ -44,6 +50,7 @@ STATUS
 """
 
 import ast
+import importlib
 import re
 import unicodedata
 from collections.abc import Set as AbstractSet
@@ -53,6 +60,17 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 import bpy
+
+# The export can simplify its converted mesh, so this core depends on the
+# simplify core -- a sibling in Source/lib, already on sys.path by the time any
+# front-end imports this module. Reloaded here because front-ends reload only
+# the module they import: without it, an edit to mesh_simplify_core would stay
+# invisible to the export until Blender restarts, the exact trap the front-end
+# bootstraps exist to avoid. reload() re-executes in place, so a front-end that
+# also holds this module sees the same, current, object.
+import mesh_simplify_core as simplify_core
+
+importlib.reload(simplify_core)
 
 PRESET_SUBDIR = "operator/export_scene.fbx"
 PRESET_FILE = "Unreal_-_mesh.py"
@@ -89,6 +107,8 @@ class WarningCode(Enum):
     MISSING_EXPORT_DIR = auto()
     NAME_SANITIZED = auto()
     NAME_TAKEN = auto()
+    SIMPLIFY_SKIPPED = auto()
+    SIMPLIFY_NOTE = auto()
 
 
 @dataclass(frozen=True)
@@ -115,6 +135,9 @@ class ExportSettings:
     export_collection: str = "Export"
     name_override: str = ""
     origin_center: OriginCenter = 'MEDIAN'
+    # None skips simplification. Settings rather than a bool, so on/off and the
+    # parameters travel as one value and cannot disagree.
+    simplify: simplify_core.SimplifySettings | None = None
     write_fbx: bool = True
     allow_overwrite: bool = False
 
@@ -143,6 +166,9 @@ class ExportPlan:
     unit_scale: float
     unit_system: str
     target_exists: bool
+    # What simplifying will do, analysed on the evaluated mesh. None when
+    # simplify is off, or on but not possible -- the latter with a warning.
+    simplify: simplify_core.SimplifyAnalysis | None = None
     stale_preset_path: str | None = None
     unparsed_preset_lines: list[str] = field(default_factory=list)
     warnings: list[PlanWarning] = field(default_factory=list)
@@ -157,9 +183,11 @@ class ExportPlan:
 @dataclass
 class ExportResult:
     mesh_object_name: str
+    # Final counts, after simplification if it ran.
     verts: int
     polys: int
     fbx_path: Path | None = None
+    simplify: simplify_core.SimplifyResult | None = None
 
 
 # -------------------------------------------------------------------- helpers
@@ -223,8 +251,16 @@ def load_preset_kwargs(
     return kwargs, unparsed, stale_path
 
 
-def evaluated_counts(obj: bpy.types.Object) -> tuple[int, int]:
-    """Vertex/polygon counts the conversion would produce, without converting.
+def evaluate_source(
+    obj: bpy.types.Object, simplify: simplify_core.SimplifySettings | None
+) -> tuple[int, int, simplify_core.SimplifyAnalysis | None, str | None]:
+    """What the conversion would produce, without converting.
+
+    Returns vertex and polygon counts, plus -- when simplify settings are given
+    -- the simplify analysis of that same geometry, or the reason it is not
+    possible. One evaluation serves both, since the temporary mesh is the
+    expensive part. The analysis holds plain values only, so it survives the
+    to_mesh_clear() below.
 
     Uses the evaluated depsgraph so modifiers (Solidify here) are included. This
     is the expensive call that keeps build_plan() out of Panel.draw().
@@ -237,7 +273,13 @@ def evaluated_counts(obj: bpy.types.Object) -> tuple[int, int]:
         # which yields a mesh (possibly empty), so this is a guard, not a path.
         if mesh is None:
             raise PlanError(f"{obj.name!r} produced no geometry when evaluated.")
-        return len(mesh.vertices), len(mesh.polygons)
+        verts, polys = len(mesh.vertices), len(mesh.polygons)
+        if simplify is None:
+            return verts, polys, None, None
+        try:
+            return verts, polys, simplify_core.analyze_mesh(mesh, simplify), None
+        except simplify_core.SimplifyError as exc:
+            return verts, polys, None, str(exc)
     finally:
         evaluated.to_mesh_clear()
 
@@ -485,8 +527,25 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
     out_path: Path | None = (
         export_dir / f"{mesh_name}.fbx" if export_dir is not None else None
     )
-    verts, polys = evaluated_counts(source)
+    verts, polys, analysis, skip_reason = evaluate_source(source, settings.simplify)
     units = context.scene.unit_settings
+
+    # Simplify is best-effort inside an export: when it cannot help, the export
+    # still goes ahead unsimplified, and says why. None of these warnings block.
+    if settings.simplify is not None:
+        if analysis is not None and analysis.blocking_warnings:
+            skip_reason = "; ".join(w.message for w in analysis.blocking_warnings)
+            analysis = None
+        if analysis is None:
+            warnings.append(PlanWarning(
+                WarningCode.SIMPLIFY_SKIPPED,
+                f"Simplify skipped, exporting unsimplified: {skip_reason}",
+            ))
+        else:
+            for note in analysis.warnings:
+                warnings.append(PlanWarning(
+                    WarningCode.SIMPLIFY_NOTE, f"Simplify: {note.message}"
+                ))
 
     if polys == 0:
         warnings.append(PlanWarning(
@@ -527,6 +586,7 @@ def build_plan(context: bpy.types.Context, settings: ExportSettings) -> ExportPl
         unit_scale=units.scale_length,
         unit_system=units.system,
         target_exists=target_exists,
+        simplify=analysis,
         stale_preset_path=stale_path,
         unparsed_preset_lines=unparsed,
         warnings=warnings,
@@ -598,6 +658,15 @@ def execute_plan(context: bpy.types.Context, plan: ExportPlan) -> ExportResult:
             )
         created.append(mesh)
 
+        # Simplify straight after converting, before the transform and origin
+        # steps. The plan analysed the evaluated mesh in this same local space,
+        # so simplify_mesh()'s re-check sees identical geometry; and origin_set
+        # MEDIAN averages the vertices, so it has to see the final vertex set.
+        # A mismatch raises, which the handler below turns into a rollback.
+        simplified: simplify_core.SimplifyResult | None = None
+        if plan.simplify is not None:
+            simplified = simplify_core.simplify_mesh(mesh, plan.simplify)
+
         # Order matters: convert first so the curve geometry and Solidify bake
         # into real vertices, then apply rot/scale on the resulting mesh. Applying
         # the transform to the curve beforehand rescales control points and
@@ -648,4 +717,5 @@ def execute_plan(context: bpy.types.Context, plan: ExportPlan) -> ExportResult:
         verts=len(mesh.vertices),
         polys=len(mesh.polygons),
         fbx_path=written,
+        simplify=simplified,
     )

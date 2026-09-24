@@ -30,8 +30,20 @@ WHAT IT DOES
 WHY IT VERIFIES THE GRID FIRST
     The column arithmetic is only valid on a genuine row-major grid. Dissolving
     the wrong edges on an unexpected topology would quietly wreck the mesh, so
-    build_simplify_plan() reconciles vertex, edge and face counts against the
-    model and raises rather than guessing.
+    recover_grid() reconciles vertex and edge counts against the model and
+    raises rather than guessing.
+
+ENTRY POINTS
+    Active-object workflow (cli/simplify_mesh.py, the Simplify panel):
+        build_simplify_plan()  -> SimplifyPlan, read-only, Edit or Object mode
+        execute_simplify_plan() mutates the plan's mesh in place
+
+    Mesh-level, for callers that own the mesh (the export pipeline):
+        analyze_mesh()   -> SimplifyAnalysis, read-only, plain values only
+        simplify_mesh()     mutates the given mesh, Object mode
+
+    Both mutating paths re-analyse before dissolving and refuse if the mesh no
+    longer matches what was planned.
 
 STATUS
     Written 2026-09-22 against measurements from InnerRearRamp, and executed
@@ -49,11 +61,15 @@ STATUS
     92.5% only because its 204 rim edges were uncounted; with them, 100%). On the
     same mesh expect 576 + 6 = 582 edges dissolved and 2 x 97 x 4 = 776 verts.
     Also refuses multi-user and library-linked mesh data.
+
+    Tested in Blender 2026-09-23: split into analysis and application so the export
+    pipeline can simplify its converted duplicate. Execution now re-checks rows,
+    shells and the dissolve set as well as width before touching anything.
 """
 
 import math
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum, auto
 
 import bmesh
@@ -117,17 +133,20 @@ class GridModel:
         """Column for a vertex index.
 
         Valid across every shell only because shell_stride is a multiple of
-        width -- checked in build_simplify_plan, not assumed here.
+        width -- checked in recover_grid(), not assumed here.
         """
         return vertex_index % self.width
 
 
-@dataclass
-class SimplifyPlan:
-    source: bpy.types.Object
-    # source.data, narrowed to Mesh once in build_simplify_plan() so nothing
-    # downstream touches the untyped Object.data union again.
-    mesh: bpy.types.Mesh
+@dataclass(kw_only=True)
+class SimplifyAnalysis:
+    """What simplifying a mesh would do, as plain values only.
+
+    Holds no bpy references, so it outlives the mesh it was computed from. The
+    export pipeline depends on that: it analyses a temporary evaluated mesh at
+    plan time, frees it, and carries this forward to execution.
+    """
+
     settings: SimplifySettings
     grid: GridModel
     keep_columns: tuple[int, ...]
@@ -143,6 +162,20 @@ class SimplifyPlan:
     @property
     def blocking_warnings(self) -> list[SimplifyWarning]:
         return [w for w in self.warnings if w.blocking]
+
+
+@dataclass(kw_only=True)
+class SimplifyPlan(SimplifyAnalysis):
+    """An analysis bound to the object it will edit in place.
+
+    kw_only on both classes is what lets this add required fields after the
+    base class's defaulted warnings field.
+    """
+
+    source: bpy.types.Object
+    # source.data, narrowed to Mesh once in build_simplify_plan() so nothing
+    # downstream touches the untyped Object.data union again.
+    mesh: bpy.types.Mesh
 
 
 @dataclass
@@ -258,10 +291,96 @@ def profile_turn_angles(bm: bmesh.types.BMesh, grid: GridModel) -> tuple[float, 
 
 # ----------------------------------------------------------------- plan/apply
 
+def _analyze(bm: bmesh.types.BMesh, settings: SimplifySettings) -> SimplifyAnalysis:
+    """The geometry half of planning: which columns go, and what that leaves.
+
+    Reads bm only. Warnings here are about the geometry; whether the mesh may be
+    edited in place is the caller's concern, since only the caller knows who
+    owns it.
+    """
+    grid = recover_grid(bm, settings.min_grid_confidence)
+    angles = profile_turn_angles(bm, grid)
+
+    if settings.keep_columns_override:
+        keep = tuple(sorted(set(settings.keep_columns_override)))
+        out_of_range = [c for c in keep if not 0 <= c < grid.width]
+        if out_of_range:
+            raise SimplifyError(
+                f"keep_columns_override {out_of_range} outside 0..{grid.width - 1}."
+            )
+    else:
+        keep = tuple(
+            c for c, angle in enumerate(angles)
+            if angle >= settings.angle_threshold_deg
+        )
+
+    dissolve = tuple(c for c in range(grid.width) if c not in keep)
+
+    # Every edge that will go, counted here so the dry run can report it
+    # without touching anything.
+    rim = _end_rim_edges(bm, grid, dissolve)
+    doomed = _lengthwise_edges(bm, grid, dissolve) + rim
+
+    warnings: list[SimplifyWarning] = []
+    if not dissolve:
+        warnings.append(SimplifyWarning(
+            WarningCode.NOTHING_TO_DISSOLVE,
+            f"Every column turns through at least "
+            f"{settings.angle_threshold_deg} degrees, so none are redundant.",
+            blocking=True,
+        ))
+    if len(keep) == grid.width:
+        warnings.append(SimplifyWarning(
+            WarningCode.KEEPS_EVERY_COLUMN,
+            "Keep set covers the whole profile; nothing would change.",
+            blocking=True,
+        ))
+    if grid.confidence < 0.95:
+        warnings.append(SimplifyWarning(
+            WarningCode.LOW_GRID_CONFIDENCE,
+            f"Grid model explains {grid.confidence:.1%} of edges. Check the "
+            f"result; anything below ~95% means unexpected topology.",
+        ))
+
+    # Every row, end rows included, keeps only the kept columns: with its
+    # end-cap rim edge dissolved as well, an end-row vertex in a dissolved
+    # column drops to 2 edges like any other, and use_verts removes it.
+    #
+    # Unverified for a single shell (no Solidify, so no rim): there the
+    # end-row vertex sits on an open boundary and is assumed to dissolve at
+    # 2 edges too. Compare this against the result on the first such run.
+    predicted = grid.shells * grid.rows * len(keep)
+    return SimplifyAnalysis(
+        settings=settings,
+        grid=grid,
+        keep_columns=keep,
+        dissolve_columns=dissolve,
+        column_angles_deg=angles,
+        edges_to_dissolve=len(doomed),
+        rim_edges_to_dissolve=len(rim),
+        predicted_verts=predicted,
+        warnings=warnings,
+    )
+
+
+def analyze_mesh(mesh: bpy.types.Mesh, settings: SimplifySettings) -> SimplifyAnalysis:
+    """Analyse any mesh without touching it, including a temporary one.
+
+    For callers that do not have an active object to plan against -- the export
+    pipeline analyses the curve's evaluated mesh before converting anything.
+    """
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        return _analyze(bm, settings)
+    finally:
+        bm.free()
+
+
 def build_simplify_plan(
     context: bpy.types.Context, settings: SimplifySettings
 ) -> SimplifyPlan:
-    """Work out which columns to dissolve. Changes nothing."""
+    """Work out which columns to dissolve on the active mesh. Changes nothing."""
     obj = context.active_object
     if obj is None:
         raise SimplifyError("No active object. Select the converted mesh.")
@@ -273,94 +392,38 @@ def build_simplify_plan(
 
     bm, is_live = _open_bmesh(mesh)
     try:
-        grid = recover_grid(bm, settings.min_grid_confidence)
-        angles = profile_turn_angles(bm, grid)
-
-        if settings.keep_columns_override:
-            keep = tuple(sorted(set(settings.keep_columns_override)))
-            out_of_range = [c for c in keep if not 0 <= c < grid.width]
-            if out_of_range:
-                raise SimplifyError(
-                    f"keep_columns_override {out_of_range} outside 0..{grid.width - 1}."
-                )
-        else:
-            keep = tuple(
-                c for c, angle in enumerate(angles)
-                if angle >= settings.angle_threshold_deg
-            )
-
-        dissolve = tuple(c for c in range(grid.width) if c not in keep)
-
-        # Every edge that will go, counted here so the dry run can report it
-        # without touching anything.
-        rim = _end_rim_edges(bm, grid, dissolve)
-        doomed = _lengthwise_edges(bm, grid, dissolve) + rim
-
-        warnings: list[SimplifyWarning] = []
-        if not dissolve:
-            warnings.append(SimplifyWarning(
-                WarningCode.NOTHING_TO_DISSOLVE,
-                f"Every column turns through at least "
-                f"{settings.angle_threshold_deg} degrees, so none are redundant.",
-                blocking=True,
-            ))
-        if len(keep) == grid.width:
-            warnings.append(SimplifyWarning(
-                WarningCode.KEEPS_EVERY_COLUMN,
-                "Keep set covers the whole profile; nothing would change.",
-                blocking=True,
-            ))
-        # This edits the mesh in place, so anything else holding it would change
-        # too. Blocking warnings rather than errors so a dry run still reports
-        # the full analysis.
-        if not mesh.is_editable:
-            warnings.append(SimplifyWarning(
-                WarningCode.LINKED_DATA,
-                f"Mesh {mesh.name!r} is linked from a library and cannot be "
-                f"edited in this file.",
-                blocking=True,
-            ))
-        # A fake user is a user count with no one behind it; it shares nothing.
-        sharers = mesh.users - int(mesh.use_fake_user)
-        if sharers > 1:
-            warnings.append(SimplifyWarning(
-                WarningCode.SHARED_DATA,
-                f"Mesh {mesh.name!r} has {sharers} users, so dissolving it in place "
-                f"would change every one of them. Make it single-user first "
-                f"(Object > Relations > Make Single User).",
-                blocking=True,
-            ))
-        if grid.confidence < 0.95:
-            warnings.append(SimplifyWarning(
-                WarningCode.LOW_GRID_CONFIDENCE,
-                f"Grid model explains {grid.confidence:.1%} of edges. Check the "
-                f"result; anything below ~95% means unexpected topology.",
-            ))
-
-        # Every row, end rows included, keeps only the kept columns: with its
-        # end-cap rim edge dissolved as well, an end-row vertex in a dissolved
-        # column drops to 2 edges like any other, and use_verts removes it.
-        #
-        # Unverified for a single shell (no Solidify, so no rim): there the
-        # end-row vertex sits on an open boundary and is assumed to dissolve at
-        # 2 edges too. Compare this against the result on the first such run.
-        predicted = grid.shells * grid.rows * len(keep)
-        return SimplifyPlan(
-            source=obj,
-            mesh=mesh,
-            settings=settings,
-            grid=grid,
-            keep_columns=keep,
-            dissolve_columns=dissolve,
-            column_angles_deg=angles,
-            edges_to_dissolve=len(doomed),
-            rim_edges_to_dissolve=len(rim),
-            predicted_verts=predicted,
-            warnings=warnings,
-        )
+        analysis = _analyze(bm, settings)
     finally:
         if not is_live:
             bm.free()
+
+    # This edits the mesh in place, so anything else holding it would change
+    # too. Blocking warnings rather than errors so a dry run still reports the
+    # full analysis.
+    ownership: list[SimplifyWarning] = []
+    if not mesh.is_editable:
+        ownership.append(SimplifyWarning(
+            WarningCode.LINKED_DATA,
+            f"Mesh {mesh.name!r} is linked from a library and cannot be "
+            f"edited in this file.",
+            blocking=True,
+        ))
+    # A fake user is a user count with no one behind it; it shares nothing.
+    sharers = mesh.users - int(mesh.use_fake_user)
+    if sharers > 1:
+        ownership.append(SimplifyWarning(
+            WarningCode.SHARED_DATA,
+            f"Mesh {mesh.name!r} has {sharers} users, so dissolving it in place "
+            f"would change every one of them. Make it single-user first "
+            f"(Object > Relations > Make Single User).",
+            blocking=True,
+        ))
+
+    # Field by field rather than dataclasses.asdict(), which would also turn the
+    # nested GridModel into a dict.
+    base = {f.name: getattr(analysis, f.name) for f in fields(SimplifyAnalysis)}
+    base["warnings"] = [*analysis.warnings, *ownership]
+    return SimplifyPlan(**base, source=obj, mesh=mesh)
 
 
 def _lengthwise_edges(
@@ -406,45 +469,58 @@ def _end_rim_edges(
     return found
 
 
+def _apply(bm: bmesh.types.BMesh, expected: SimplifyAnalysis) -> SimplifyResult:
+    """Dissolve on bm, after confirming it is still the mesh `expected` describes.
+
+    Mutates bm only; writing it back is the caller's job. Re-analysed rather than
+    trusted: the analysis may come from a different mesh than the one being
+    edited -- the export plans on the evaluated mesh and executes on the
+    converted one -- so the grid and dissolve set must match before anything goes.
+    """
+    if expected.blocking_warnings:
+        raise SimplifyError("; ".join(w.message for w in expected.blocking_warnings))
+
+    current = _analyze(bm, expected.settings)
+    was = (expected.grid.width, expected.grid.rows, expected.grid.shells,
+           expected.dissolve_columns)
+    now = (current.grid.width, current.grid.rows, current.grid.shells,
+           current.dissolve_columns)
+    if now != was:
+        raise SimplifyError(
+            f"Mesh no longer matches the plan (width, rows, shells, dissolve: "
+            f"{was} -> {now}). Re-plan before executing."
+        )
+
+    grid = current.grid
+    verts_before, faces_before = len(bm.verts), len(bm.faces)
+    doomed = (
+        _lengthwise_edges(bm, grid, expected.dissolve_columns)
+        + _end_rim_edges(bm, grid, expected.dissolve_columns)
+    )
+
+    # One call, after collecting every edge: indices shift as soon as anything
+    # is removed, so a second pass would address the wrong geometry.
+    bmesh.ops.dissolve_edges(bm, edges=doomed, use_verts=True)
+
+    return SimplifyResult(
+        verts_before=verts_before,
+        verts_after=len(bm.verts),
+        faces_before=faces_before,
+        faces_after=len(bm.faces),
+        edges_dissolved=len(doomed),
+    )
+
+
 def execute_simplify_plan(
     context: bpy.types.Context, plan: SimplifyPlan
 ) -> SimplifyResult:
-    """Apply the plan. The only mutating function in this module."""
-    if plan.blocking_warnings:
-        raise SimplifyError(
-            "; ".join(w.message for w in plan.blocking_warnings)
-        )
-
+    """Apply the plan to its mesh, in Edit or Object mode. Mutates the mesh."""
     mesh = plan.mesh
     bm, is_live = _open_bmesh(mesh)
     try:
-        # Rebuilt rather than reusing the plan's bmesh: that one was opened for
+        # Reopened rather than reusing the plan's bmesh: that one was opened for
         # reading and, outside edit mode, has already been freed.
-        grid = recover_grid(bm, plan.settings.min_grid_confidence)
-        if grid.width != plan.grid.width:
-            raise SimplifyError(
-                f"Mesh changed since the plan was built (width {plan.grid.width} "
-                f"-> {grid.width}). Re-plan before executing."
-            )
-
-        verts_before, faces_before = len(bm.verts), len(bm.faces)
-        doomed = (
-            _lengthwise_edges(bm, grid, plan.dissolve_columns)
-            + _end_rim_edges(bm, grid, plan.dissolve_columns)
-        )
-
-        # One call, after collecting every edge: indices shift as soon as
-        # anything is removed, so a second pass would address the wrong geometry.
-        bmesh.ops.dissolve_edges(bm, edges=doomed, use_verts=True)
-
-        result = SimplifyResult(
-            verts_before=verts_before,
-            verts_after=len(bm.verts),
-            faces_before=faces_before,
-            faces_after=len(bm.faces),
-            edges_dissolved=len(doomed),
-        )
-
+        result = _apply(bm, plan)
         if is_live:
             bmesh.update_edit_mesh(mesh)
         else:
@@ -454,3 +530,20 @@ def execute_simplify_plan(
     finally:
         if not is_live:
             bm.free()
+
+
+def simplify_mesh(mesh: bpy.types.Mesh, expected: SimplifyAnalysis) -> SimplifyResult:
+    """Apply an analysis to a mesh outside Edit Mode. Mutates the mesh.
+
+    For callers that own the mesh outright and have no plan bound to an active
+    object -- the export pipeline runs this on its freshly converted duplicate.
+    """
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        result = _apply(bm, expected)
+        bm.to_mesh(mesh)
+        mesh.update()
+        return result
+    finally:
+        bm.free()

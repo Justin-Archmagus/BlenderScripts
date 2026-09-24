@@ -57,7 +57,15 @@ from bpy.props import (
     PointerProperty,
     StringProperty,
 )
-from bpy.types import Collection, Context, Object, Operator, Panel, PropertyGroup
+from bpy.types import (
+    Collection,
+    Context,
+    Object,
+    Operator,
+    Panel,
+    PropertyGroup,
+    UILayout,
+)
 
 if TYPE_CHECKING:
     # Stub-only module from fake-bpy-module; it does not exist inside Blender,
@@ -230,6 +238,13 @@ class PINBALL_PG_spline_export(PropertyGroup):
         ],
         default='MEDIAN',
     )
+    # Only the switch lives here. The parameters are the Simplify panel's, drawn
+    # under this checkbox too, so there is one set of settings, not two to drift.
+    simplify: BoolProperty(
+        name="Simplify",
+        description="Reduce geometry of converted mesh if possible",
+        default=True,
+    )
     write_fbx: BoolProperty(
         name="Write FBX",
         description="Off converts the mesh but touches no files",
@@ -248,6 +263,9 @@ class PINBALL_PG_spline_export(PropertyGroup):
     preview_out_path: StringProperty()
     preview_verts: IntProperty()
     preview_polys: IntProperty()
+    # One display line; empty when simplify is off or will be skipped (the skip
+    # reason is among the warnings).
+    preview_simplify: StringProperty()
     preview_blocked: BoolProperty(default=False)
     preview_warnings: CollectionProperty(type=PINBALL_PG_warning)
 
@@ -257,8 +275,15 @@ def _props(context: Context) -> PINBALL_PG_spline_export:
 
 
 def _settings_from(
-    core: ModuleType, props: PINBALL_PG_spline_export
+    core: ModuleType,
+    props: PINBALL_PG_spline_export,
+    simplify_props: "PINBALL_PG_simplify",
 ) -> "ExportSettings":
+    # The export core exposes the simplify core it depends on, so the settings
+    # class comes from the same module object the export will use.
+    simplify = (
+        _simplify_settings(core.simplify_core, simplify_props) if props.simplify else None
+    )
     return core.ExportSettings(
         export_dir=props.export_dir,
         # Core is name-based, so the pointer is resolved here. Read fresh each
@@ -268,6 +293,7 @@ def _settings_from(
         ),
         name_override=props.name_override,
         origin_center=props.origin_center,
+        simplify=simplify,
         write_fbx=props.write_fbx,
         allow_overwrite=props.allow_overwrite,
     )
@@ -285,6 +311,12 @@ def _store_preview(props: PINBALL_PG_spline_export, plan: "ExportPlan") -> None:
     props.preview_out_path = str(plan.out_path) if plan.out_path else ""
     props.preview_verts = plan.verts
     props.preview_polys = plan.polys
+    analysis = plan.simplify
+    props.preview_simplify = (
+        f"Simplify: keep {list(analysis.keep_columns)}, "
+        f"{plan.verts} -> {analysis.predicted_verts} verts"
+        if analysis is not None else ""
+    )
     props.preview_blocked = bool(plan.blocking_warnings)
     props.preview_valid = True
 
@@ -316,7 +348,8 @@ class PINBALL_OT_spline_preview(Operator):
         props = _props(context)
         try:
             core = _get_core()
-            plan = core.build_plan(context, _settings_from(core, props))
+            settings = _settings_from(core, props, _simplify_props(context))
+            plan = core.build_plan(context, settings)
         except Exception as exc:
             # Broad on purpose, as in the simplify operators: a PlanError, a failed
             # module load, or an OSError reading the preset all belong in the
@@ -357,7 +390,8 @@ class PINBALL_OT_spline_export(Operator):
             core = _get_core()
             # Rebuilt rather than reused: the cache is a display projection, and
             # the scene may have changed since Preview ran.
-            plan = core.build_plan(context, _settings_from(core, props))
+            settings = _settings_from(core, props, _simplify_props(context))
+            plan = core.build_plan(context, settings)
             result = core.execute_plan(context, plan)
         except Exception as exc:
             # execute_plan() rolls back its own partial mesh before raising, so
@@ -369,9 +403,15 @@ class PINBALL_OT_spline_export(Operator):
         # The scene now contains a new object, so the cache no longer describes it.
         props.preview_valid = False
         destination = result.fbx_path or "no file written"
+        simplified = (
+            f" (simplified {result.simplify.verts_before} -> "
+            f"{result.simplify.verts_after} verts)"
+            if result.simplify is not None else ""
+        )
         self.report(
             {'INFO'},
-            f"{result.mesh_object_name}: {result.polys} polys -> {destination}",
+            f"{result.mesh_object_name}: {result.polys} polys{simplified} "
+            f"-> {destination}",
         )
         return {'FINISHED'}
 
@@ -414,6 +454,12 @@ class PINBALL_PT_spline_export(Panel):
             col.label(text="Pick a target collection", icon='ERROR')
 
         col = layout.column()
+        col.prop(props, "simplify")
+        sub = col.column()
+        sub.enabled = props.simplify
+        _draw_simplify_settings(sub, _simplify_props(context))
+        sub.label(text="Shared with the Simplify panel", icon='LINKED')
+        col = layout.column()
         col.prop(props, "write_fbx")
         sub = col.column()
         sub.enabled = props.write_fbx
@@ -433,6 +479,8 @@ class PINBALL_PT_spline_export(Panel):
                     text=f"{props.preview_verts} verts, {props.preview_polys} polys",
                     icon='CHECKMARK',
                 )
+                if props.preview_simplify:
+                    box.label(text=props.preview_simplify, icon='MOD_DECIM')
                 if props.preview_out_path:
                     box.label(text=Path(props.preview_out_path).name, icon='EXPORT')
                 for warning in props.preview_warnings:
@@ -495,6 +543,16 @@ class PINBALL_PG_simplify(PropertyGroup):
 
 def _simplify_props(context: Context) -> PINBALL_PG_simplify:
     return getattr(context.scene, SIMPLIFY_SCENE_PROP)
+
+
+def _draw_simplify_settings(layout: UILayout, props: PINBALL_PG_simplify) -> None:
+    """The simplify parameters, drawn identically by both panels."""
+    layout.prop(props, "use_column_override")
+    if props.use_column_override:
+        layout.prop(props, "column_override")
+    else:
+        layout.prop(props, "angle_threshold_deg")
+    layout.prop(props, "min_grid_confidence")
 
 
 def _parse_columns(text: str) -> tuple[int, ...]:
@@ -649,13 +707,7 @@ class PINBALL_PT_simplify(Panel):
         else:
             header.label(text=mesh.name, icon='OUTLINER_OB_MESH')
 
-        col = layout.column()
-        col.prop(props, "use_column_override")
-        if props.use_column_override:
-            col.prop(props, "column_override")
-        else:
-            col.prop(props, "angle_threshold_deg")
-        col.prop(props, "min_grid_confidence")
+        _draw_simplify_settings(layout.column(), props)
 
         layout.separator()
         layout.operator(PINBALL_OT_simplify_preview.bl_idname, icon='VIEWZOOM')
